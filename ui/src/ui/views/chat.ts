@@ -377,7 +377,6 @@ export function renderChat(props: ChatProps) {
               ${ref((el) => el && adjustTextareaHeight(el as HTMLTextAreaElement))}
               .value=${props.draft}
               dir=${detectTextDirection(props.draft)}
-              ?disabled=${!props.connected}
               @keydown=${(e: KeyboardEvent) => {
                 if (e.key !== "Enter") {
                   return;
@@ -388,9 +387,6 @@ export function renderChat(props: ChatProps) {
                 if (e.shiftKey) {
                   return;
                 } // Allow Shift+Enter for line breaks
-                if (!props.connected) {
-                  return;
-                }
                 e.preventDefault();
                 if (canCompose) {
                   props.onSend();
@@ -415,7 +411,6 @@ export function renderChat(props: ChatProps) {
             </button>
             <button
               class="btn primary"
-              ?disabled=${!props.connected}
               @click=${props.onSend}
             >
               ${isBusy ? "Queue" : "Send"}<kbd class="btn-kbd">↵</kbd>
