@@ -322,13 +322,16 @@ If you want to rely on env keys (e.g. exported in your `~/.profile`), run local 
 
 ## Docker runners (optional “works in Linux” checks)
 
-These run `pnpm test:live` inside the repo Docker image, mounting your local config dir and workspace (and sourcing `~/.profile` if mounted):
+These run focused checks in Docker, mounting your local config dir and workspace (and sourcing `~/.profile` if mounted):
 
-- Direct models: `pnpm test:docker:live-models` (script: `scripts/test-live-models-docker.sh`)
-- Gateway + dev agent: `pnpm test:docker:live-gateway` (script: `scripts/test-live-gateway-models-docker.sh`)
+- Direct models (live): `pnpm test:docker:live-models` (script: `scripts/test-live-models-docker.sh`)
+- Gateway + dev agent (live): `pnpm test:docker:live-gateway` (script: `scripts/test-live-gateway-models-docker.sh`)
 - Onboarding wizard (TTY, full scaffolding): `pnpm test:docker:onboard` (script: `scripts/e2e/onboard-docker.sh`)
 - Gateway networking (two containers, WS auth + health): `pnpm test:docker:gateway-network` (script: `scripts/e2e/gateway-network-docker.sh`)
+- QR import smoke: `pnpm test:docker:qr` (script: `scripts/e2e/qr-import-docker.sh`)
+- Installer doctor switch smoke: `pnpm test:docker:doctor-switch` (script: `scripts/e2e/doctor-install-switch-docker.sh`)
 - Plugins (custom extension load + registry smoke): `pnpm test:docker:plugins` (script: `scripts/e2e/plugins-docker.sh`)
+- Cleanup helper (remove test containers/images): `pnpm test:docker:cleanup` (script: `scripts/test-cleanup-docker.sh`)
 
 Useful env vars:
 
@@ -340,7 +343,9 @@ Useful env vars:
 
 ## Docs sanity
 
-Run docs checks after doc edits: `pnpm docs:list`.
+Run docs checks after doc edits: `pnpm check:docs`.
+
+(If you only need to refresh the generated docs index/listing, use `pnpm docs:list`.)
 
 ## Offline regression (CI-safe)
 
