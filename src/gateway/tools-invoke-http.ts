@@ -5,6 +5,7 @@ import {
   resolveGroupToolPolicy,
   resolveSubagentToolPolicy,
 } from "../agents/pi-tools.policy.js";
+import type { AnyAgentTool } from "../agents/pi-tools.types.js";
 import {
   applyToolPolicyPipeline,
   buildDefaultToolPolicyPipelineSteps,
@@ -43,6 +44,11 @@ type ToolsInvokeBody = {
   args?: unknown;
   sessionKey?: unknown;
   dryRun?: unknown;
+};
+
+type InvokableAgentTool = AnyAgentTool & {
+  parameters?: unknown;
+  execute?: (toolCallId: string, args: Record<string, unknown>) => Promise<unknown>;
 };
 
 function resolveSessionKeyFromBody(body: ToolsInvokeBody): string | undefined {
@@ -253,10 +259,8 @@ export async function handleToolsInvokeHttpRequest(
   });
 
   const subagentFiltered = applyToolPolicyPipeline({
-    // oxlint-disable-next-line typescript/no-explicit-any
-    tools: allTools as any,
-    // oxlint-disable-next-line typescript/no-explicit-any
-    toolMeta: (tool) => getPluginToolMeta(tool as any),
+    tools: allTools,
+    toolMeta: (tool) => getPluginToolMeta(tool),
     warn: logWarn,
     steps: [
       ...buildDefaultToolPolicyPipelineSteps({
@@ -286,7 +290,7 @@ export async function handleToolsInvokeHttpRequest(
   const gatewayDenySet = new Set(gatewayDenyNames);
   const gatewayFiltered = subagentFiltered.filter((t) => !gatewayDenySet.has(t.name));
 
-  const tool = gatewayFiltered.find((t) => t.name === toolName);
+  const tool = gatewayFiltered.find((t) => t.name === toolName) as InvokableAgentTool | undefined;
   if (!tool) {
     sendJson(res, 404, {
       ok: false,
@@ -297,13 +301,11 @@ export async function handleToolsInvokeHttpRequest(
 
   try {
     const toolArgs = mergeActionIntoArgsIfSupported({
-      // oxlint-disable-next-line typescript/no-explicit-any
-      toolSchema: (tool as any).parameters,
+      toolSchema: tool.parameters,
       action,
       args,
     });
-    // oxlint-disable-next-line typescript/no-explicit-any
-    const result = await (tool as any).execute?.(`http-${Date.now()}`, toolArgs);
+    const result = await tool.execute?.(`http-${Date.now()}`, toolArgs);
     sendJson(res, 200, { ok: true, result });
   } catch (err) {
     if (isToolInputError(err)) {

@@ -18,6 +18,7 @@ import {
 import { logVerbose } from "../../globals.js";
 import { clearCommandLane, getQueueSize } from "../../process/command-queue.js";
 import { normalizeMainKey } from "../../routing/session-key.js";
+import { resolveGatewayMessageChannel } from "../../utils/message-channel.js";
 import { isReasoningTagProvider } from "../../utils/provider-utils.js";
 import { hasControlCommand } from "../command-detection.js";
 import { buildInboundMediaNote } from "../media-note.js";
@@ -319,8 +320,9 @@ export async function runPreparedReply(
     }
   }
   if (resetTriggered && command.isAuthorizedSender) {
-    // oxlint-disable-next-line typescript/no-explicit-any
-    const channel = ctx.OriginatingChannel || (command.channel as any);
+    const channel =
+      resolveGatewayMessageChannel(ctx.OriginatingChannel) ??
+      resolveGatewayMessageChannel(command.channel);
     const to = ctx.OriginatingTo || command.from || command.to;
     if (channel && to) {
       const modelLabel = `${provider}/${model}`;

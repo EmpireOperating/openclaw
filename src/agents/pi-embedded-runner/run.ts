@@ -841,15 +841,17 @@ export async function runEmbeddedPiAgent(
               thinkLevel = fallbackThinking;
               continue;
             }
-            // FIX: Throw FailoverError for prompt errors when fallbacks configured
-            // This enables model fallback for quota/rate limit errors during prompt submission
-            if (fallbackConfigured && isFailoverErrorMessage(errorText)) {
+            // Throw FailoverError for prompt errors that are failover-classified.
+            // This prevents quota/rate-limit-classified prompt failures from being
+            // returned as normal assistant payloads and being treated as completed runs.
+            if (isFailoverErrorMessage(errorText) && promptFailoverReason !== "timeout") {
+              const reason = promptFailoverReason ?? "unknown";
               throw new FailoverError(errorText, {
-                reason: promptFailoverReason ?? "unknown",
+                reason,
                 provider,
                 model: modelId,
                 profileId: lastProfileId,
-                status: resolveFailoverStatus(promptFailoverReason ?? "unknown"),
+                status: resolveFailoverStatus(reason),
               });
             }
             throw promptError;
@@ -929,17 +931,12 @@ export async function runEmbeddedPiAgent(
               continue;
             }
 
-            if (fallbackConfigured) {
-              // Prefer formatted error message (user-friendly) over raw errorMessage
+            if (assistantFailoverReason && assistantFailoverReason !== "timeout") {
+              const reason = assistantFailoverReason;
+              // Prefer raw provider text so root failure is preserved in failover
+              // reporting; generic friendliness is applied only to user-facing
+              // completion payloads, not failover telemetry.
               const message =
-                (lastAssistant
-                  ? formatAssistantErrorText(lastAssistant, {
-                      cfg: params.config,
-                      sessionKey: params.sessionKey ?? params.sessionId,
-                      provider: activeErrorContext.provider,
-                      model: activeErrorContext.model,
-                    })
-                  : undefined) ||
                 lastAssistant?.errorMessage?.trim() ||
                 (timedOut
                   ? "LLM request timed out."
@@ -957,7 +954,7 @@ export async function runEmbeddedPiAgent(
                 resolveFailoverStatus(assistantFailoverReason ?? "unknown") ??
                 (isTimeoutErrorMessage(message) ? 408 : undefined);
               throw new FailoverError(message, {
-                reason: assistantFailoverReason ?? "unknown",
+                reason,
                 provider: activeErrorContext.provider,
                 model: activeErrorContext.model,
                 profileId: lastProfileId,

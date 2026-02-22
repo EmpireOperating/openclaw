@@ -20,6 +20,8 @@ import { generateSlugViaLLM } from "../../llm-slug-generator.js";
 
 const log = createSubsystemLogger("hooks/session-memory");
 
+type SessionMessageTextBlock = { type?: unknown; text?: unknown };
+
 /**
  * Read recent messages from session file for slug generation
  */
@@ -46,8 +48,10 @@ async function getRecentSessionContent(
             }
             // Extract text content
             const text = Array.isArray(msg.content)
-              ? // oxlint-disable-next-line typescript/no-explicit-any
-                msg.content.find((c: any) => c.type === "text")?.text
+              ? (msg.content.find(
+                  (c: unknown): c is SessionMessageTextBlock =>
+                    !!c && typeof c === "object" && (c as SessionMessageTextBlock).type === "text",
+                )?.text as string | undefined)
               : msg.content;
             if (text && !text.startsWith("/")) {
               allMessages.push(`${role}: ${text}`);
