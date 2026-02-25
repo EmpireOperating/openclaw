@@ -167,4 +167,27 @@ describe("createOpenClawCodingTools", () => {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it("accepts snake_case edit aliases (old_text/new_text)", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-snake-edit-"));
+    try {
+      const filePath = path.join(tmpDir, "snake-edit.txt");
+      await fs.writeFile(filePath, "status: world\n", "utf8");
+
+      const tools = createOpenClawCodingTools({ workspaceDir: tmpDir });
+      const editTool = tools.find((tool) => tool.name === "edit");
+      expect(editTool).toBeDefined();
+
+      await editTool?.execute("tool-snake-edit", {
+        path: "snake-edit.txt",
+        old_text: "world",
+        new_text: [{ kind: "text", value: "universe" }],
+      });
+
+      const edited = await fs.readFile(filePath, "utf8");
+      expect(edited).toBe("status: universe\n");
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

@@ -47,6 +47,18 @@ describe("formatAssistantErrorText", () => {
     expect(result).toContain("Session history looks corrupted");
     expect(result).toContain("/new");
   });
+  it("does not convert edit payload schema errors into rate-limit text", () => {
+    const msg = makeAssistantError("Missing required parameter: newText (newText or new_string)");
+    const result = formatAssistantErrorText(msg);
+    expect(result).toContain("newText");
+    expect(result).not.toContain("rate limit");
+  });
+  it("does not convert exact-text tool schema failures into rate-limit text", () => {
+    const msg = makeAssistantError("Could not find the exact text in file: old snippet");
+    const result = formatAssistantErrorText(msg);
+    expect(result).toContain("exact text");
+    expect(result).not.toContain("rate limit");
+  });
   it("handles JSON-wrapped role errors", () => {
     const msg = makeAssistantError('{"error":{"message":"400 Incorrect role information"}}');
     const result = formatAssistantErrorText(msg);
@@ -95,7 +107,18 @@ describe("formatAssistantErrorText", () => {
   });
   it("returns a friendly message for rate limit errors", () => {
     const msg = makeAssistantError("429 rate limit reached");
-    expect(formatAssistantErrorText(msg)).toContain("rate limit reached");
+    const result = formatAssistantErrorText(msg) ?? "";
+    expect(result).toContain("Rate limit reached");
+    expect(result).toContain("Raw: HTTP 429");
+  });
+
+  it("classifies usage-cap style rate limits clearly", () => {
+    const msg = makeAssistantError(
+      '429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit. Please try again later."}}',
+    );
+    const result = formatAssistantErrorText(msg) ?? "";
+    expect(result).toContain("Usage cap reached");
+    expect(result).toContain("not an API key leak");
   });
 
   it("returns a friendly message for empty stream chunk errors", () => {

@@ -508,6 +508,7 @@ describe("subscribeEmbeddedPiSession", () => {
     );
 
     expect(lifecycleError).toBeDefined();
-    expect(lifecycleError?.[0]?.data?.error).toContain("API rate limit reached");
+    expect(lifecycleError?.[0]?.data?.error).toContain("Rate limit reached");
+    expect(lifecycleError?.[0]?.data?.error).toContain("Raw: HTTP 429");
   });
 });

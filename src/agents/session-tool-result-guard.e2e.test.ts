@@ -85,6 +85,57 @@ describe("installSessionToolResultGuard", () => {
     expectPersistedRoles(sm, ["assistant", "toolResult"]);
   });
 
+  it("seeds pending tool calls from existing history and flushes before next user message", () => {
+    const sm = SessionManager.inMemory();
+
+    sm.appendMessage(
+      asAppendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_hist_1", name: "exec", arguments: {} }],
+        stopReason: "toolUse",
+      }),
+    );
+
+    installSessionToolResultGuard(sm);
+
+    sm.appendMessage(
+      asAppendMessage({
+        role: "user",
+        content: "retry",
+        timestamp: Date.now(),
+      }),
+    );
+
+    const messages = expectPersistedRoles(sm, ["assistant", "toolResult", "user"]);
+    const synthetic = messages[1] as { toolCallId?: string; isError?: boolean };
+    expect(synthetic.toolCallId).toBe("call_hist_1");
+    expect(synthetic.isError).toBe(true);
+  });
+
+  it("does not seed pending tool calls from aborted assistant history", () => {
+    const sm = SessionManager.inMemory();
+
+    sm.appendMessage(
+      asAppendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_hist_abort", name: "exec", arguments: {} }],
+        stopReason: "aborted",
+      }),
+    );
+
+    installSessionToolResultGuard(sm);
+
+    sm.appendMessage(
+      asAppendMessage({
+        role: "user",
+        content: "retry",
+        timestamp: Date.now(),
+      }),
+    );
+
+    expectPersistedRoles(sm, ["assistant", "user"]);
+  });
+
   it("does not add synthetic toolResult when a matching one exists", () => {
     const sm = SessionManager.inMemory();
     installSessionToolResultGuard(sm);

@@ -17,13 +17,54 @@ export function formatBillingErrorMessage(provider?: string, model?: string): st
 
 export const BILLING_ERROR_USER_MESSAGE = formatBillingErrorMessage();
 
-const RATE_LIMIT_ERROR_USER_MESSAGE = "⚠️ API rate limit reached. Please try again later.";
 const OVERLOADED_ERROR_USER_MESSAGE =
   "The AI service is temporarily overloaded. Please try again in a moment.";
 
+const USAGE_CAP_HINT_RE =
+  /usage limit|current quota|exceed(?:ed|s)? your account(?:'s)? rate limit|plan limit|billing period/i;
+const THROUGHPUT_RATE_LIMIT_HINT_RE =
+  /too many requests|requests per (?:minute|hour|day)|tokens per (?:minute|hour|day)|tpm\b|rpm\b|throttl|retry-after/i;
+
+function isLikelyUsageCapRateLimit(raw: string): boolean {
+  if (!raw) {
+    return false;
+  }
+  return USAGE_CAP_HINT_RE.test(raw);
+}
+
+function isLikelyThroughputRateLimit(raw: string): boolean {
+  if (!raw) {
+    return false;
+  }
+  return THROUGHPUT_RATE_LIMIT_HINT_RE.test(raw);
+}
+
+function formatRateLimitErrorUserMessage(raw: string): string {
+  const base = isLikelyUsageCapRateLimit(raw)
+    ? "⚠️ Usage cap reached for this account. This is not an API key leak. Wait for reset, then try again."
+    : isLikelyThroughputRateLimit(raw)
+      ? "⚠️ API key rate-limited (request/token throughput). Wait briefly or reduce request rate, then retry."
+      : "⚠️ Rate limit reached. Try again shortly.";
+
+  return `${base}\nRaw: ${formatRawAssistantErrorForUi(raw)}`;
+}
+
+const TOOL_SCHEMA_ERROR_HINT_RE =
+  /\b(new[_-]?(?:text|string)|missing required parameter|could not find(?:\s+the)? exact text(?: in file)?|tool call(?:ed)? (?:input|arguments)|tool(?:[_-]?)?use[_-]?(?:id|arguments|input)|tool input|invalid tool arguments|tool validation error)\b/i;
+
+function isToolSchemaError(raw: string): boolean {
+  if (!raw) {
+    return false;
+  }
+  return TOOL_SCHEMA_ERROR_HINT_RE.test(raw);
+}
+
 function formatRateLimitOrOverloadedErrorCopy(raw: string): string | undefined {
+  if (isToolSchemaError(raw)) {
+    return undefined;
+  }
   if (isRateLimitErrorMessage(raw)) {
-    return RATE_LIMIT_ERROR_USER_MESSAGE;
+    return formatRateLimitErrorUserMessage(raw);
   }
   if (isOverloadedErrorMessage(raw)) {
     return OVERLOADED_ERROR_USER_MESSAGE;

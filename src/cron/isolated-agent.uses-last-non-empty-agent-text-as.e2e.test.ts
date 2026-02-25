@@ -185,6 +185,31 @@ describe("runCronIsolatedAgentTurn", () => {
     });
   });
 
+  it("returns error status for runs with only error payloads", async () => {
+    await withTempHome(async (home) => {
+      vi.mocked(runEmbeddedPiAgent).mockReset();
+      vi.mocked(runEmbeddedPiAgent).mockResolvedValue({
+        payloads: [{ text: "⚠️ API rate limit reached. Please try again later.", isError: true }],
+        meta: {
+          durationMs: 5,
+          agentMeta: {
+            sessionId: "s",
+            provider: "p",
+            model: "m",
+          },
+        },
+      });
+      const { res } = await runCronTurn(home, {
+        jobPayload: DEFAULT_AGENT_TURN_PAYLOAD,
+        mockTexts: null,
+      });
+
+      expect(res.status).toBe("error");
+      expect(res.summary).toBeUndefined();
+      expect(res.outputText).toBeUndefined();
+    });
+  });
+
   it("appends current time after the cron header line", async () => {
     await withTempHome(async (home) => {
       await runCronTurn(home, {

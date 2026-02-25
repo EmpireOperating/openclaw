@@ -76,6 +76,57 @@ function capToolResultSize(msg: AgentMessage): AgentMessage {
   return { ...msg, content: newContent } as AgentMessage;
 }
 
+function seedPendingToolCallsFromHistory(params: {
+  sessionManager: SessionManager;
+  pending: Map<string, string | undefined>;
+}): void {
+  let messages: AgentMessage[] = [];
+  try {
+    messages = params.sessionManager
+      .getEntries()
+      .filter((entry) => entry.type === "message")
+      .map((entry) => (entry as { message?: AgentMessage }).message)
+      .filter((message): message is AgentMessage => Boolean(message));
+  } catch {
+    return;
+  }
+  if (messages.length === 0) {
+    return;
+  }
+
+  const resolvedToolResultIds = new Set<string>();
+  for (const message of messages) {
+    if ((message as { role?: unknown }).role !== "toolResult") {
+      continue;
+    }
+    const id = extractToolResultId(message as Extract<AgentMessage, { role: "toolResult" }>);
+    if (id) {
+      resolvedToolResultIds.add(id);
+    }
+  }
+
+  for (const message of messages) {
+    if ((message as { role?: unknown }).role !== "assistant") {
+      continue;
+    }
+    const stopReason = (message as { stopReason?: unknown }).stopReason;
+    if (stopReason === "error" || stopReason === "aborted") {
+      continue;
+    }
+    const sanitized = sanitizeToolCallInputs([message]);
+    if (sanitized.length === 0 || sanitized[0]?.role !== "assistant") {
+      continue;
+    }
+    const assistant = sanitized[0];
+    const toolCalls = extractToolCallsFromAssistant(assistant);
+    for (const call of toolCalls) {
+      if (!resolvedToolResultIds.has(call.id)) {
+        params.pending.set(call.id, call.name);
+      }
+    }
+  }
+}
+
 export function installSessionToolResultGuard(
   sessionManager: SessionManager,
   opts?: {
@@ -126,6 +177,9 @@ export function installSessionToolResultGuard(
 
   const allowSyntheticToolResults = opts?.allowSyntheticToolResults ?? true;
   const beforeWrite = opts?.beforeMessageWriteHook;
+  if (allowSyntheticToolResults) {
+    seedPendingToolCallsFromHistory({ sessionManager, pending });
+  }
 
   /**
    * Run the before_message_write hook. Returns the (possibly modified) message,

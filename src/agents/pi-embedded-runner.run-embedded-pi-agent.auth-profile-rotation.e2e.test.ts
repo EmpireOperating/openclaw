@@ -373,6 +373,53 @@ describe("runEmbeddedPiAgent auth profile rotation", () => {
         runId: "run:user",
       });
 
+      expect.fail("expected rate-limit prompt to throw");
+    } catch (err) {
+      expect(err).toMatchObject({
+        name: "FailoverError",
+        reason: "rate_limit",
+      });
+    }
+
+    expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(1);
+    await expectProfileP2UsageUnchanged(agentDir);
+  });
+
+  it("throws FailoverError for prompt-rate-limit failover without model fallback", async () => {
+    const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-agent-"));
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-workspace-"));
+    try {
+      await writeAuthStore(agentDir);
+
+      runEmbeddedAttemptMock.mockResolvedValueOnce(
+        makeAttempt({
+          promptError: new Error("Too many requests"),
+          assistantTexts: [],
+          lastAssistant: undefined,
+        }),
+      );
+
+      await expect(
+        runEmbeddedPiAgent({
+          sessionId: "session:test",
+          sessionKey: "agent:test:user-prompt",
+          sessionFile: path.join(workspaceDir, "session.jsonl"),
+          workspaceDir,
+          agentDir,
+          config: makeConfig(),
+          prompt: "hello",
+          provider: "openai",
+          model: "mock-1",
+          authProfileId: "openai:p1",
+          authProfileIdSource: "user",
+          timeoutMs: 5_000,
+          runId: "run:user-prompt",
+        }),
+      ).rejects.toMatchObject({
+        name: "FailoverError",
+        reason: "rate_limit",
+      });
+
       expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(1);
       await expectProfileP2UsageUnchanged(agentDir);
     } finally {

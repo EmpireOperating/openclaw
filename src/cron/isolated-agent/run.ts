@@ -54,7 +54,7 @@ import {
   isExternalHookSession,
 } from "../../security/external-content.js";
 import { resolveCronDeliveryPlan } from "../delivery.js";
-import type { CronJob, CronRunOutcome, CronRunTelemetry } from "../types.js";
+import type { CronJob, CronRunOutcome, CronRunStatus, CronRunTelemetry } from "../types.js";
 import { resolveDeliveryTarget } from "./delivery-target.js";
 import {
   isHeartbeatOnlyResponse,
@@ -504,6 +504,9 @@ export async function runCronIsolatedAgentTurn(params: {
   }
 
   const payloads = runResult.payloads ?? [];
+  const nonErrorPayloads = payloads.filter((payload) => payload?.isError !== true);
+  const runOutcomeStatus: CronRunStatus =
+    payloads.length > 0 && nonErrorPayloads.length === 0 ? "error" : "ok";
 
   // Update token+model fields in the session store.
   // Also collect best-effort telemetry for the cron run log.
@@ -556,11 +559,11 @@ export async function runCronIsolatedAgentTurn(params: {
     }
     await persistSessionEntry();
   }
-  const firstText = payloads[0]?.text ?? "";
-  let summary = pickSummaryFromPayloads(payloads) ?? pickSummaryFromOutput(firstText);
-  let outputText = pickLastNonEmptyTextFromPayloads(payloads);
+  const firstText = nonErrorPayloads[0]?.text ?? "";
+  let summary = pickSummaryFromPayloads(nonErrorPayloads) ?? pickSummaryFromOutput(firstText);
+  let outputText = pickLastNonEmptyTextFromPayloads(nonErrorPayloads);
   let synthesizedText = outputText?.trim() || summary?.trim() || undefined;
-  const deliveryPayload = pickLastDeliverablePayload(payloads);
+  const deliveryPayload = pickLastDeliverablePayload(nonErrorPayloads);
   let deliveryPayloads =
     deliveryPayload !== undefined
       ? [deliveryPayload]
@@ -575,7 +578,8 @@ export async function runCronIsolatedAgentTurn(params: {
 
   // Skip delivery for heartbeat-only responses (HEARTBEAT_OK with no real content).
   const ackMaxChars = resolveHeartbeatAckMaxChars(agentCfg);
-  const skipHeartbeatDelivery = deliveryRequested && isHeartbeatOnlyResponse(payloads, ackMaxChars);
+  const skipHeartbeatDelivery =
+    deliveryRequested && isHeartbeatOnlyResponse(nonErrorPayloads, ackMaxChars);
   const skipMessagingToolDelivery =
     deliveryRequested &&
     runResult.didSendViaMessagingTool === true &&
@@ -602,7 +606,7 @@ export async function runCronIsolatedAgentTurn(params: {
         });
       }
       logWarn(`[cron:${params.job.id}] ${resolvedDelivery.error.message}`);
-      return withRunSession({ status: "ok", summary, outputText, ...telemetry });
+      return withRunSession({ status: runOutcomeStatus, summary, outputText, ...telemetry });
     }
     if (!resolvedDelivery.to) {
       const message = "cron delivery target is missing";
@@ -616,7 +620,7 @@ export async function runCronIsolatedAgentTurn(params: {
         });
       }
       logWarn(`[cron:${params.job.id}] ${message}`);
-      return withRunSession({ status: "ok", summary, outputText, ...telemetry });
+      return withRunSession({ status: runOutcomeStatus, summary, outputText, ...telemetry });
     }
     const identity = resolveAgentOutboundIdentity(cfgWithAgentDefaults, agentId);
 
@@ -710,7 +714,7 @@ export async function runCronIsolatedAgentTurn(params: {
       if (activeSubagentRuns > 0) {
         // Parent orchestration is still in progress; avoid announcing a partial
         // update to the main requester.
-        return withRunSession({ status: "ok", summary, outputText, ...telemetry });
+        return withRunSession({ status: runOutcomeStatus, summary, outputText, ...telemetry });
       }
       if (
         (hadActiveDescendants || expectedSubagentFollowup) &&
@@ -720,10 +724,10 @@ export async function runCronIsolatedAgentTurn(params: {
       ) {
         // Descendants existed but no post-orchestration synthesis arrived, so
         // suppress stale parent text like "on it, pulling everything together".
-        return withRunSession({ status: "ok", summary, outputText, ...telemetry });
+        return withRunSession({ status: runOutcomeStatus, summary, outputText, ...telemetry });
       }
       if (synthesizedText.toUpperCase() === SILENT_REPLY_TOKEN.toUpperCase()) {
-        return withRunSession({ status: "ok", summary, outputText, ...telemetry });
+        return withRunSession({ status: runOutcomeStatus, summary, outputText, ...telemetry });
       }
       try {
         const didAnnounce = await runSubagentAnnounceFlow({
@@ -777,5 +781,5 @@ export async function runCronIsolatedAgentTurn(params: {
     }
   }
 
-  return withRunSession({ status: "ok", summary, outputText, delivered, ...telemetry });
+  return withRunSession({ status: runOutcomeStatus, summary, outputText, delivered, ...telemetry });
 }
