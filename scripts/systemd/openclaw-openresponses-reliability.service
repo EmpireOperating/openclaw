@@ -1,0 +1,13 @@
+[Unit]
+Description=OpenClaw OpenResponses Tool-Call Reliability Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=OPENCLAW_REPO_DIR=%h/openclaw
+EnvironmentFile=-%h/.config/openclaw/openresponses-tool-call-reliability.env
+ExecStart=/usr/bin/env bash -lc "${OPENCLAW_REPO_DIR}/scripts/openresponses-tool-call-reliability-monitor.sh"
+
+[Install]
+WantedBy=default.target
