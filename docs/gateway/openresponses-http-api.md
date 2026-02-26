@@ -84,6 +84,116 @@ By default the endpoint is **stateless per request** (a new session key is gener
 If the request includes an OpenResponses `user` string, the Gateway derives a stable session key
 from it, so repeated calls can share an agent session.
 
+## Direct action enforcement flag
+
+By default, tool-bearing prompts without an explicit `tool_choice` are still model-decided (`auto`).
+
+To force direct-action prompts (for example `run this`, `do it`, `check now`) to require a tool call
+before assistant text, enable:
+
+- `gateway.http.endpoints.responses.implicitToolChoiceRequiredForDirectAction: true`
+
+```json5
+{
+  gateway: {
+    http: {
+      endpoints: {
+        responses: {
+          enabled: true,
+          implicitToolChoiceRequiredForDirectAction: true,
+        },
+      },
+    },
+  },
+}
+```
+
+## Tool call reliability diagnostics
+
+Use the diagnostics endpoint to inspect reliability counters:
+
+- `GET /v1/responses/diagnostics/tool-call-reliability`
+- Uses the same bearer auth as `POST /v1/responses`
+
+Example response shape:
+
+```json
+{
+  "object": "openresponses.tool_call_reliability",
+  "metrics": {
+    "toolChoiceNotSatisfied": 0,
+    "toolChoiceRetryAttempted": 0,
+    "toolChoiceRetrySucceeded": 0,
+    "toolChoiceRetryFailed": 0,
+    "toolCallAfterTextDelta": 0
+  }
+}
+```
+
+Counters are process-lifetime totals. For alerting, evaluate deltas over a fixed window.
+
+## Smoke check script
+
+Run the built-in smoke script:
+
+```bash
+GATEWAY_TOKEN=YOUR_TOKEN scripts/openresponses-tool-call-reliability-smoke.sh
+```
+
+Useful overrides:
+
+- `GATEWAY_URL` (default `http://127.0.0.1:18789`)
+- `AGENT_ID` (default `main`)
+- `WARN_RETRY_ATTEMPT_RATE_PCT` (default `3`)
+- `WARN_RETRY_FAIL_RATE_PCT` (default `25`)
+- `WARN_TEXT_BEFORE_TOOL_RATE_PCT` (default `5`)
+- `FAIL_ON_WARN` (`1` default, set `0` for report-only mode)
+
+The script sends a small request set, compares diagnostics before/after, and exits non-zero when thresholds are exceeded.
+
+## Linux systemd timer setup
+
+For a repo-driven install on your Linux gateway host:
+
+Full runbook: [OpenResponses Reliability Monitoring](/automation/openresponses-reliability-monitoring)
+
+```bash
+cd ~/openclaw
+chmod +x scripts/openresponses-tool-call-reliability-*.sh scripts/setup-openresponses-reliability-monitor.sh
+scripts/setup-openresponses-reliability-monitor.sh --no-start
+$EDITOR ~/.config/openclaw/openresponses-tool-call-reliability.env
+systemctl --user enable --now openclaw-openresponses-reliability.timer
+```
+
+Check status and logs:
+
+```bash
+systemctl --user status openclaw-openresponses-reliability.timer
+systemctl --user status openclaw-openresponses-reliability.service
+journalctl --user -u openclaw-openresponses-reliability.service -n 120 --no-pager
+```
+
+The env file supports:
+
+- Gateway routing and auth (`GATEWAY_URL`, `GATEWAY_TOKEN`, `AGENT_ID`)
+- warning thresholds (`WARN_RETRY_ATTEMPT_RATE_PCT`, `WARN_RETRY_FAIL_RATE_PCT`, `WARN_TEXT_BEFORE_TOOL_RATE_PCT`)
+- alert hook destinations (`ALERT_NTFY_TOPIC`, `ALERT_WEBHOOK_URL`, `ALERT_WEBHOOK_BEARER_TOKEN`, `ALERT_PHONE`)
+
+## Alert threshold recommendations
+
+Recommended starting points for 15-minute windows:
+
+- Warning:
+  - `retry_attempt_rate = ΔtoolChoiceRetryAttempted / Δtotal_responses_requests` > `3%`
+  - `retry_fail_rate = ΔtoolChoiceRetryFailed / max(ΔtoolChoiceRetryAttempted, 1)` > `25%`
+  - `text_before_tool_rate = ΔtoolCallAfterTextDelta / Δtotal_responses_requests` > `5%`
+- Critical:
+  - `retry_attempt_rate` > `7%`
+  - `retry_fail_rate` > `40%`
+  - `text_before_tool_rate` > `10%`
+
+Tune thresholds by baseline traffic. Start looser during rollout, then tighten once behavior stabilizes.
+
 ## Request shape (supported)
 
 The request follows the OpenResponses API with item-based input. Current support:

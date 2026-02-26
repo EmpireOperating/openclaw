@@ -256,6 +256,10 @@
       "destination": "/automation/auth-monitoring"
     },
     {
+      "source": "/openresponses-reliability-monitoring",
+      "destination": "/automation/openresponses-reliability-monitoring"
+    },
+    {
       "source": "/camera",
       "destination": "/nodes/camera"
     },
@@ -1014,7 +1018,8 @@
                   "automation/webhook",
                   "automation/gmail-pubsub",
                   "automation/poll",
-                  "automation/auth-monitoring"
+                  "automation/auth-monitoring",
+                  "automation/openresponses-reliability-monitoring"
                 ]
               },
               {
