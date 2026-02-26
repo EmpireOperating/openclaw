@@ -243,6 +243,13 @@ describe("pickPrimaryLanIPv4", () => {
     });
     expect(pickPrimaryLanIPv4()).toBeUndefined();
   });
+
+  it("returns undefined when os.networkInterfaces throws", () => {
+    vi.spyOn(os, "networkInterfaces").mockImplementation(() => {
+      throw new Error("network interfaces unavailable");
+    });
+    expect(pickPrimaryLanIPv4()).toBeUndefined();
+  });
 });
 
 describe("isPrivateOrLoopbackAddress", () => {
