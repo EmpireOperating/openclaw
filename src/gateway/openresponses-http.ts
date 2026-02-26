@@ -15,6 +15,7 @@ import type { ImageContent } from "../commands/agent/types.js";
 import type { GatewayHttpResponsesConfig } from "../config/types.gateway.js";
 import { emitAgentEvent, onAgentEvent } from "../infra/agent-events.js";
 import { logWarn } from "../logger.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
   DEFAULT_INPUT_IMAGE_MAX_BYTES,
   DEFAULT_INPUT_IMAGE_MIMES,
@@ -36,7 +37,8 @@ import {
 } from "./agent-prompt.js";
 import type { AuthRateLimiter } from "./auth-rate-limit.js";
 import type { ResolvedGatewayAuth } from "./auth.js";
-import { sendJson, setSseHeaders, writeDone } from "./http-common.js";
+import { authorizeGatewayBearerRequestOrReply } from "./http-auth-helpers.js";
+import { sendJson, sendMethodNotAllowed, setSseHeaders, writeDone } from "./http-common.js";
 import { handleGatewayPostJsonEndpoint } from "./http-endpoint-helpers.js";
 import { resolveAgentIdForRequest, resolveSessionKey } from "./http-utils.js";
 import {
@@ -60,6 +62,64 @@ type OpenResponsesHttpOptions = {
 
 const DEFAULT_BODY_BYTES = 20 * 1024 * 1024;
 const DEFAULT_MAX_URL_PARTS = 8;
+const OPENRESPONSES_TOOL_CALL_RELIABILITY_PATH = "/v1/responses/diagnostics/tool-call-reliability";
+const openResponsesLog = createSubsystemLogger("gateway/openresponses");
+const DIRECT_ACTION_LEAD_VERBS = new Set([
+  "run",
+  "do",
+  "check",
+  "execute",
+  "fix",
+  "install",
+  "update",
+  "restart",
+  "deploy",
+  "verify",
+  "test",
+  "build",
+]);
+
+export type OpenResponsesToolCallReliabilityMetrics = {
+  toolChoiceNotSatisfied: number;
+  toolChoiceRetryAttempted: number;
+  toolChoiceRetrySucceeded: number;
+  toolChoiceRetryFailed: number;
+  toolCallAfterTextDelta: number;
+};
+
+const toolCallReliabilityMetrics: OpenResponsesToolCallReliabilityMetrics = {
+  toolChoiceNotSatisfied: 0,
+  toolChoiceRetryAttempted: 0,
+  toolChoiceRetrySucceeded: 0,
+  toolChoiceRetryFailed: 0,
+  toolCallAfterTextDelta: 0,
+};
+
+function incrementToolCallReliabilityMetric(key: keyof OpenResponsesToolCallReliabilityMetrics) {
+  toolCallReliabilityMetrics[key] += 1;
+}
+
+export function getOpenResponsesToolCallReliabilityMetrics(): OpenResponsesToolCallReliabilityMetrics {
+  return { ...toolCallReliabilityMetrics };
+}
+
+export function resetOpenResponsesToolCallReliabilityMetrics() {
+  toolCallReliabilityMetrics.toolChoiceNotSatisfied = 0;
+  toolCallReliabilityMetrics.toolChoiceRetryAttempted = 0;
+  toolCallReliabilityMetrics.toolChoiceRetrySucceeded = 0;
+  toolCallReliabilityMetrics.toolChoiceRetryFailed = 0;
+  toolCallReliabilityMetrics.toolCallAfterTextDelta = 0;
+}
+
+function describeToolChoiceRequirement(requirement?: ToolChoiceRequirement): string {
+  if (!requirement) {
+    return "none";
+  }
+  if (requirement.kind === "specific") {
+    return `function:${requirement.toolName}`;
+  }
+  return "required";
+}
 
 function writeSseEvent(res: ServerResponse, event: StreamingEvent) {
   res.write(`event: ${event.type}\n`);
@@ -84,9 +144,57 @@ function extractTextContent(content: string | ContentPart[]): string {
     .join("\n");
 }
 
+function extractLatestUserInputText(input: string | ItemParam[]): string {
+  if (typeof input === "string") {
+    return input.trim();
+  }
+
+  for (let i = input.length - 1; i >= 0; i -= 1) {
+    const item = input[i];
+    if (item.type !== "message" || item.role !== "user") {
+      continue;
+    }
+    const text = extractTextContent(item.content).trim();
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function isDirectActionPrompt(inputText: string): boolean {
+  const normalized = inputText.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  if (
+    /\b(run this|do it|check now|do that|go ahead)\b/.test(normalized) ||
+    /^(please\s+)?(run|do|check)\s+(this|it|now)\b/.test(normalized)
+  ) {
+    return true;
+  }
+
+  if (/^(what|why|how|when|where|who)\b/.test(normalized)) {
+    return false;
+  }
+
+  const words = normalized
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+  if (words.length === 0 || words.length > 8) {
+    return false;
+  }
+
+  const firstWord = words[0];
+  return DIRECT_ACTION_LEAD_VERBS.has(firstWord);
+}
+
 type ResolvedResponsesLimits = {
   maxBodyBytes: number;
   maxUrlParts: number;
+  implicitToolChoiceRequiredForDirectAction: boolean;
   files: InputFileLimits;
   images: InputImageLimits;
 };
@@ -111,6 +219,8 @@ function resolveResponsesLimits(
       typeof config?.maxUrlParts === "number"
         ? Math.max(0, Math.floor(config.maxUrlParts))
         : DEFAULT_MAX_URL_PARTS,
+    implicitToolChoiceRequiredForDirectAction:
+      config?.implicitToolChoiceRequiredForDirectAction === true,
     files: {
       ...fileLimits,
       urlAllowlist: normalizeHostnameAllowlist(files?.urlAllowlist),
@@ -130,12 +240,31 @@ function extractClientTools(body: CreateResponseBody): ClientToolDefinition[] {
   return (body.tools ?? []) as ClientToolDefinition[];
 }
 
+type ToolChoiceRequirement =
+  | { kind: "any" }
+  | {
+      kind: "specific";
+      toolName: string;
+    };
+
 function applyToolChoice(params: {
   tools: ClientToolDefinition[];
   toolChoice: CreateResponseBody["tool_choice"];
-}): { tools: ClientToolDefinition[]; extraSystemPrompt?: string } {
-  const { tools, toolChoice } = params;
+  autoRequireToolCall?: boolean;
+}): {
+  tools: ClientToolDefinition[];
+  extraSystemPrompt?: string;
+  requirement?: ToolChoiceRequirement;
+} {
+  const { tools, toolChoice, autoRequireToolCall } = params;
   if (!toolChoice) {
+    if (autoRequireToolCall && tools.length > 0) {
+      return {
+        tools,
+        extraSystemPrompt: "You must call one of the available tools before responding.",
+        requirement: { kind: "any" },
+      };
+    }
     return { tools };
   }
 
@@ -150,6 +279,7 @@ function applyToolChoice(params: {
     return {
       tools,
       extraSystemPrompt: "You must call one of the available tools before responding.",
+      requirement: { kind: "any" },
     };
   }
 
@@ -165,6 +295,7 @@ function applyToolChoice(params: {
     return {
       tools: matched,
       extraSystemPrompt: `You must call the ${targetName} tool before responding.`,
+      requirement: { kind: "specific", toolName: targetName },
     };
   }
 
@@ -266,6 +397,100 @@ function extractUsageFromResult(result: unknown): Usage {
   );
 }
 
+type PendingToolCall = {
+  id: string;
+  name: string;
+  arguments: string;
+};
+
+type ToolChoiceResolution = {
+  selectedCall?: PendingToolCall;
+  errorMessage?: string;
+};
+
+function extractToolCallMetaFromResult(result: unknown): {
+  stopReason?: string;
+  pendingToolCalls?: PendingToolCall[];
+} {
+  const meta = (result as { meta?: unknown } | null)?.meta;
+  if (!meta || typeof meta !== "object") {
+    return {};
+  }
+
+  const stopReasonRaw = (meta as { stopReason?: unknown }).stopReason;
+  const stopReason = typeof stopReasonRaw === "string" ? stopReasonRaw : undefined;
+
+  const pendingRaw = (meta as { pendingToolCalls?: unknown }).pendingToolCalls;
+  const pendingToolCalls = Array.isArray(pendingRaw)
+    ? pendingRaw.filter((entry): entry is PendingToolCall => {
+        if (!entry || typeof entry !== "object") {
+          return false;
+        }
+        const candidate = entry as {
+          id?: unknown;
+          name?: unknown;
+          arguments?: unknown;
+        };
+        return (
+          typeof candidate.id === "string" &&
+          typeof candidate.name === "string" &&
+          typeof candidate.arguments === "string"
+        );
+      })
+    : undefined;
+
+  return {
+    stopReason,
+    pendingToolCalls,
+  };
+}
+
+function resolveToolChoiceRequirement(params: {
+  requirement?: ToolChoiceRequirement;
+  stopReason?: string;
+  pendingToolCalls?: PendingToolCall[];
+}): ToolChoiceResolution {
+  const requirement = params.requirement;
+  const toolCalls =
+    params.stopReason === "tool_calls" && Array.isArray(params.pendingToolCalls)
+      ? params.pendingToolCalls
+      : [];
+
+  if (!requirement) {
+    return { selectedCall: toolCalls[0] };
+  }
+
+  if (requirement.kind === "any") {
+    if (toolCalls.length > 0) {
+      return { selectedCall: toolCalls[0] };
+    }
+    return {
+      errorMessage:
+        "tool_choice=required was not satisfied: assistant finished without a tool call.",
+    };
+  }
+
+  if (toolCalls.length === 0) {
+    return {
+      errorMessage:
+        `tool_choice.function.name="${requirement.toolName}" was not satisfied: ` +
+        "assistant finished without a tool call.",
+    };
+  }
+
+  const matched = toolCalls.find((call) => call.name === requirement.toolName);
+  if (matched) {
+    return { selectedCall: matched };
+  }
+
+  const received = toolCalls.map((call) => call.name).join(", ");
+  return {
+    errorMessage:
+      `tool_choice.function.name="${requirement.toolName}" was not satisfied: ` +
+      `assistant called ${received || "an unexpected tool"}.`,
+  };
+}
+
 function createResponseResource(params: {
   id: string;
   model: string;
@@ -328,11 +553,158 @@ async function runResponsesAgentCommand(params: {
   );
 }
 
+function buildToolChoiceRetryPrompt(requirement: ToolChoiceRequirement): string {
+  if (requirement.kind === "specific") {
+    return (
+      `RETRY INSTRUCTION: Your previous response failed tool_choice enforcement. ` +
+      `Call ONLY the ${requirement.toolName} tool now and output no assistant text.`
+    );
+  }
+  return (
+    "RETRY INSTRUCTION: Your previous response failed tool_choice enforcement. " +
+    "Call one available tool now and output no assistant text."
+  );
+}
+
+async function runResponsesAgentCommandWithToolChoiceRetry(params: {
+  message: string;
+  images: ImageContent[];
+  clientTools: ClientToolDefinition[];
+  extraSystemPrompt: string;
+  streamParams: { maxTokens: number } | undefined;
+  sessionKey: string;
+  runId: string;
+  deps: ReturnType<typeof createDefaultDeps>;
+  toolChoiceRequirement?: ToolChoiceRequirement;
+}): Promise<{
+  result: unknown;
+  stopReason?: string;
+  pendingToolCalls?: PendingToolCall[];
+  toolChoiceResolution: ToolChoiceResolution;
+}> {
+  const firstResult = await runResponsesAgentCommand({
+    message: params.message,
+    images: params.images,
+    clientTools: params.clientTools,
+    extraSystemPrompt: params.extraSystemPrompt,
+    streamParams: params.streamParams,
+    sessionKey: params.sessionKey,
+    runId: params.runId,
+    deps: params.deps,
+  });
+  const firstMeta = extractToolCallMetaFromResult(firstResult);
+  const firstResolution = resolveToolChoiceRequirement({
+    requirement: params.toolChoiceRequirement,
+    stopReason: firstMeta.stopReason,
+    pendingToolCalls: firstMeta.pendingToolCalls,
+  });
+
+  if (!params.toolChoiceRequirement || !firstResolution.errorMessage) {
+    return {
+      result: firstResult,
+      stopReason: firstMeta.stopReason,
+      pendingToolCalls: firstMeta.pendingToolCalls,
+      toolChoiceResolution: firstResolution,
+    };
+  }
+
+  incrementToolCallReliabilityMetric("toolChoiceNotSatisfied");
+  incrementToolCallReliabilityMetric("toolChoiceRetryAttempted");
+  openResponsesLog.warn("tool_choice retry started", {
+    runId: params.runId,
+    requirement: describeToolChoiceRequirement(params.toolChoiceRequirement),
+    reason: firstResolution.errorMessage,
+    stopReason: firstMeta.stopReason,
+    pendingToolCalls: (firstMeta.pendingToolCalls ?? []).map((call) => call.name),
+  });
+
+  const retryPrompt = buildToolChoiceRetryPrompt(params.toolChoiceRequirement);
+  const retrySystemPrompt = [params.extraSystemPrompt, retryPrompt].filter(Boolean).join("\n\n");
+
+  try {
+    const retryResult = await runResponsesAgentCommand({
+      message: params.message,
+      images: params.images,
+      clientTools: params.clientTools,
+      extraSystemPrompt: retrySystemPrompt,
+      streamParams: params.streamParams,
+      sessionKey: params.sessionKey,
+      runId: params.runId,
+      deps: params.deps,
+    });
+    const retryMeta = extractToolCallMetaFromResult(retryResult);
+    const retryResolution = resolveToolChoiceRequirement({
+      requirement: params.toolChoiceRequirement,
+      stopReason: retryMeta.stopReason,
+      pendingToolCalls: retryMeta.pendingToolCalls,
+    });
+
+    if (retryResolution.errorMessage) {
+      incrementToolCallReliabilityMetric("toolChoiceNotSatisfied");
+      incrementToolCallReliabilityMetric("toolChoiceRetryFailed");
+      openResponsesLog.warn("tool_choice retry failed", {
+        runId: params.runId,
+        requirement: describeToolChoiceRequirement(params.toolChoiceRequirement),
+        reason: retryResolution.errorMessage,
+        stopReason: retryMeta.stopReason,
+        pendingToolCalls: (retryMeta.pendingToolCalls ?? []).map((call) => call.name),
+      });
+    } else {
+      incrementToolCallReliabilityMetric("toolChoiceRetrySucceeded");
+      openResponsesLog.info("tool_choice retry succeeded", {
+        runId: params.runId,
+        requirement: describeToolChoiceRequirement(params.toolChoiceRequirement),
+        selectedToolCall: retryResolution.selectedCall?.name,
+      });
+    }
+
+    return {
+      result: retryResult,
+      stopReason: retryMeta.stopReason,
+      pendingToolCalls: retryMeta.pendingToolCalls,
+      toolChoiceResolution: retryResolution,
+    };
+  } catch (err) {
+    incrementToolCallReliabilityMetric("toolChoiceRetryFailed");
+    openResponsesLog.warn("tool_choice retry errored", {
+      runId: params.runId,
+      requirement: describeToolChoiceRequirement(params.toolChoiceRequirement),
+      error: String(err),
+    });
+    throw err;
+  }
+}
+
 export async function handleOpenResponsesHttpRequest(
   req: IncomingMessage,
   res: ServerResponse,
   opts: OpenResponsesHttpOptions,
 ): Promise<boolean> {
+  const requestUrl = new URL(req.url ?? "/", `http://${req.headers.host || "localhost"}`);
+  if (requestUrl.pathname === OPENRESPONSES_TOOL_CALL_RELIABILITY_PATH) {
+    if (req.method !== "GET") {
+      sendMethodNotAllowed(res, "GET");
+      return true;
+    }
+
+    const authorized = await authorizeGatewayBearerRequestOrReply({
+      req,
+      res,
+      auth: opts.auth,
+      trustedProxies: opts.trustedProxies,
+      rateLimiter: opts.rateLimiter,
+    });
+    if (!authorized) {
+      return true;
+    }
+
+    sendJson(res, 200, {
+      object: "openresponses.tool_call_reliability",
+      metrics: getOpenResponsesToolCallReliabilityMetrics(),
+    });
+    return true;
+  }
+
   const limits = resolveResponsesLimits(opts.config);
   const maxBodyBytes =
     opts.maxBodyBytes ??
@@ -462,15 +834,24 @@ export async function handleOpenResponsesHttpRequest(
   }
 
   const clientTools = extractClientTools(payload);
+  const latestUserInputText = extractLatestUserInputText(payload.input);
+  const autoRequireToolCall =
+    !payload.tool_choice &&
+    limits.implicitToolChoiceRequiredForDirectAction &&
+    isDirectActionPrompt(latestUserInputText) &&
+    clientTools.length > 0;
   let toolChoicePrompt: string | undefined;
+  let toolChoiceRequirement: ToolChoiceRequirement | undefined;
   let resolvedClientTools = clientTools;
   try {
     const toolChoiceResult = applyToolChoice({
       tools: clientTools,
       toolChoice: payload.tool_choice,
+      autoRequireToolCall,
     });
     resolvedClientTools = toolChoiceResult.tools;
     toolChoicePrompt = toolChoiceResult.extraSystemPrompt;
+    toolChoiceRequirement = toolChoiceResult.requirement;
   } catch (err) {
     logWarn(`openresponses: tool configuration failed: ${String(err)}`);
     sendJson(res, 400, {
@@ -517,7 +898,7 @@ export async function handleOpenResponsesHttpRequest(
 
   if (!stream) {
     try {
-      const result = await runResponsesAgentCommand({
+      const runOutcome = await runResponsesAgentCommandWithToolChoiceRetry({
         message: prompt.message,
         images,
         clientTools: resolvedClientTools,
@@ -526,22 +907,33 @@ export async function handleOpenResponsesHttpRequest(
         sessionKey,
         runId: responseId,
         deps,
+        toolChoiceRequirement,
       });
+      const result = runOutcome.result;
 
       const payloads = (result as { payloads?: Array<{ text?: string }> } | null)?.payloads;
       const usage = extractUsageFromResult(result);
-      const meta = (result as { meta?: unknown } | null)?.meta;
-      const stopReason =
-        meta && typeof meta === "object" ? (meta as { stopReason?: string }).stopReason : undefined;
-      const pendingToolCalls =
-        meta && typeof meta === "object"
-          ? (meta as { pendingToolCalls?: Array<{ id: string; name: string; arguments: string }> })
-              .pendingToolCalls
-          : undefined;
+      const toolChoiceResolution = runOutcome.toolChoiceResolution;
+
+      if (toolChoiceResolution.errorMessage) {
+        const response = createResponseResource({
+          id: responseId,
+          model,
+          status: "failed",
+          output: [],
+          usage,
+          error: {
+            code: "tool_choice_not_satisfied",
+            message: toolChoiceResolution.errorMessage,
+          },
+        });
+        sendJson(res, 422, response);
+        return true;
+      }
 
       // If agent called a client tool, return function_call instead of text
-      if (stopReason === "tool_calls" && pendingToolCalls && pendingToolCalls.length > 0) {
-        const functionCall = pendingToolCalls[0];
+      if (toolChoiceResolution.selectedCall) {
+        const functionCall = toolChoiceResolution.selectedCall;
         const functionCallItemId = `call_${randomUUID()}`;
         const response = createResponseResource({
           id: responseId,
@@ -602,33 +994,135 @@ export async function handleOpenResponsesHttpRequest(
   setSseHeaders(res);
 
   let accumulatedText = "";
+  const shouldBufferAssistantText =
+    Boolean(toolChoiceRequirement) || resolvedClientTools.length > 0;
   let sawAssistantDelta = false;
+  let emittedAssistantDelta = false;
   let closed = false;
   let unsubscribe = () => {};
   let finalUsage: Usage | undefined;
-  let finalizeRequested: { status: ResponseResource["status"]; text: string } | null = null;
+  let lifecyclePhase: "end" | "error" | null = null;
+  let runFinished = false;
+  let stopReason: string | undefined;
+  let pendingToolCalls: PendingToolCall[] | undefined;
+  let toolChoiceResolution: ToolChoiceResolution | undefined;
 
   const maybeFinalize = () => {
     if (closed) {
       return;
     }
-    if (!finalizeRequested) {
+    if (!runFinished || !lifecyclePhase) {
       return;
     }
     if (!finalUsage) {
       return;
     }
     const usage = finalUsage;
+    if (toolChoiceResolution?.errorMessage) {
+      const failedResponse = createResponseResource({
+        id: responseId,
+        model,
+        status: "failed",
+        output: [],
+        usage,
+        error: {
+          code: "tool_choice_not_satisfied",
+          message: toolChoiceResolution.errorMessage,
+        },
+      });
+      closed = true;
+      unsubscribe();
+      writeSseEvent(res, { type: "response.failed", response: failedResponse });
+      writeDone(res);
+      res.end();
+      return;
+    }
+
+    const pendingToolCall = toolChoiceResolution?.selectedCall;
 
     closed = true;
     unsubscribe();
+
+    if (pendingToolCall) {
+      writeSseEvent(res, {
+        type: "response.output_text.done",
+        item_id: outputItemId,
+        output_index: 0,
+        content_index: 0,
+        text: "",
+      });
+      writeSseEvent(res, {
+        type: "response.content_part.done",
+        item_id: outputItemId,
+        output_index: 0,
+        content_index: 0,
+        part: { type: "output_text", text: "" },
+      });
+
+      const completedItem = createAssistantOutputItem({
+        id: outputItemId,
+        text: "",
+        status: "completed",
+      });
+      writeSseEvent(res, {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: completedItem,
+      });
+
+      const functionCallItemId = `call_${randomUUID()}`;
+      const functionCallItem = {
+        type: "function_call" as const,
+        id: functionCallItemId,
+        call_id: pendingToolCall.id,
+        name: pendingToolCall.name,
+        arguments: pendingToolCall.arguments,
+      };
+      writeSseEvent(res, {
+        type: "response.output_item.added",
+        output_index: 1,
+        item: functionCallItem,
+      });
+      writeSseEvent(res, {
+        type: "response.output_item.done",
+        output_index: 1,
+        item: { ...functionCallItem, status: "completed" as const },
+      });
+
+      const incompleteResponse = createResponseResource({
+        id: responseId,
+        model,
+        status: "incomplete",
+        output: [completedItem, functionCallItem],
+        usage,
+      });
+
+      writeSseEvent(res, { type: "response.completed", response: incompleteResponse });
+      writeDone(res);
+      res.end();
+      return;
+    }
+
+    const finalText = accumulatedText || "No response from OpenClaw.";
+    const finalStatus = lifecyclePhase === "error" ? "failed" : "completed";
+
+    if (shouldBufferAssistantText && finalText && !emittedAssistantDelta) {
+      emittedAssistantDelta = true;
+      writeSseEvent(res, {
+        type: "response.output_text.delta",
+        item_id: outputItemId,
+        output_index: 0,
+        content_index: 0,
+        delta: finalText,
+      });
+    }
 
     writeSseEvent(res, {
       type: "response.output_text.done",
       item_id: outputItemId,
       output_index: 0,
       content_index: 0,
-      text: finalizeRequested.text,
+      text: finalText,
     });
 
     writeSseEvent(res, {
@@ -636,12 +1130,12 @@ export async function handleOpenResponsesHttpRequest(
       item_id: outputItemId,
       output_index: 0,
       content_index: 0,
-      part: { type: "output_text", text: finalizeRequested.text },
+      part: { type: "output_text", text: finalText },
     });
 
     const completedItem = createAssistantOutputItem({
       id: outputItemId,
-      text: finalizeRequested.text,
+      text: finalText,
       status: "completed",
     });
 
@@ -654,7 +1148,7 @@ export async function handleOpenResponsesHttpRequest(
     const finalResponse = createResponseResource({
       id: responseId,
       model,
-      status: finalizeRequested.status,
+      status: finalStatus,
       output: [completedItem],
       usage,
     });
@@ -662,14 +1156,6 @@ export async function handleOpenResponsesHttpRequest(
     writeSseEvent(res, { type: "response.completed", response: finalResponse });
     writeDone(res);
     res.end();
-  };
-
-  const requestFinalize = (status: ResponseResource["status"], text: string) => {
-    if (finalizeRequested) {
-      return;
-    }
-    finalizeRequested = { status, text };
-    maybeFinalize();
   };
 
   // Send initial events
@@ -722,6 +1208,10 @@ export async function handleOpenResponsesHttpRequest(
       sawAssistantDelta = true;
       accumulatedText += content;
 
+      if (shouldBufferAssistantText) {
+        return;
+      }
+      emittedAssistantDelta = true;
       writeSseEvent(res, {
         type: "response.output_text.delta",
         item_id: outputItemId,
@@ -734,10 +1224,14 @@ export async function handleOpenResponsesHttpRequest(
 
     if (evt.stream === "lifecycle") {
       const phase = evt.data?.phase;
-      if (phase === "end" || phase === "error") {
-        const finalText = accumulatedText || "No response from OpenClaw.";
-        const finalStatus = phase === "error" ? "failed" : "completed";
-        requestFinalize(finalStatus, finalText);
+      if (phase === "error") {
+        lifecyclePhase = "error";
+        maybeFinalize();
+        return;
+      }
+      if (phase === "end" && !lifecyclePhase) {
+        lifecyclePhase = "end";
+        maybeFinalize();
       }
     }
   });
@@ -749,7 +1243,7 @@ export async function handleOpenResponsesHttpRequest(
 
   void (async () => {
     try {
-      const result = await runResponsesAgentCommand({
+      const runOutcome = await runResponsesAgentCommandWithToolChoiceRetry({
         message: prompt.message,
         images,
         clientTools: resolvedClientTools,
@@ -758,9 +1252,18 @@ export async function handleOpenResponsesHttpRequest(
         sessionKey,
         runId: responseId,
         deps,
+        toolChoiceRequirement,
       });
+      const result = runOutcome.result;
 
       finalUsage = extractUsageFromResult(result);
+      stopReason = runOutcome.stopReason;
+      pendingToolCalls = runOutcome.pendingToolCalls;
+      toolChoiceResolution = runOutcome.toolChoiceResolution;
+      if (sawAssistantDelta && toolChoiceResolution.selectedCall) {
+        incrementToolCallReliabilityMetric("toolCallAfterTextDelta");
+      }
+      runFinished = true;
       maybeFinalize();
 
       if (closed) {
@@ -768,87 +1271,11 @@ export async function handleOpenResponsesHttpRequest(
       }
 
       // Fallback: if no streaming deltas were received, send the full response
-      if (!sawAssistantDelta) {
+      const hasPendingToolCall =
+        stopReason === "tool_calls" && Boolean(toolChoiceResolution?.selectedCall);
+      if (!sawAssistantDelta && !hasPendingToolCall && !toolChoiceResolution?.errorMessage) {
         const resultAny = result as { payloads?: Array<{ text?: string }>; meta?: unknown };
         const payloads = resultAny.payloads;
-        const meta = resultAny.meta;
-        const stopReason =
-          meta && typeof meta === "object"
-            ? (meta as { stopReason?: string }).stopReason
-            : undefined;
-        const pendingToolCalls =
-          meta && typeof meta === "object"
-            ? (
-                meta as {
-                  pendingToolCalls?: Array<{ id: string; name: string; arguments: string }>;
-                }
-              ).pendingToolCalls
-            : undefined;
-
-        // If agent called a client tool, emit function_call instead of text
-        if (stopReason === "tool_calls" && pendingToolCalls && pendingToolCalls.length > 0) {
-          const functionCall = pendingToolCalls[0];
-          const usage = finalUsage ?? createEmptyUsage();
-
-          writeSseEvent(res, {
-            type: "response.output_text.done",
-            item_id: outputItemId,
-            output_index: 0,
-            content_index: 0,
-            text: "",
-          });
-          writeSseEvent(res, {
-            type: "response.content_part.done",
-            item_id: outputItemId,
-            output_index: 0,
-            content_index: 0,
-            part: { type: "output_text", text: "" },
-          });
-
-          const completedItem = createAssistantOutputItem({
-            id: outputItemId,
-            text: "",
-            status: "completed",
-          });
-          writeSseEvent(res, {
-            type: "response.output_item.done",
-            output_index: 0,
-            item: completedItem,
-          });
-
-          const functionCallItemId = `call_${randomUUID()}`;
-          const functionCallItem = {
-            type: "function_call" as const,
-            id: functionCallItemId,
-            call_id: functionCall.id,
-            name: functionCall.name,
-            arguments: functionCall.arguments,
-          };
-          writeSseEvent(res, {
-            type: "response.output_item.added",
-            output_index: 1,
-            item: functionCallItem,
-          });
-          writeSseEvent(res, {
-            type: "response.output_item.done",
-            output_index: 1,
-            item: { ...functionCallItem, status: "completed" as const },
-          });
-
-          const incompleteResponse = createResponseResource({
-            id: responseId,
-            model,
-            status: "incomplete",
-            output: [completedItem, functionCallItem],
-            usage,
-          });
-          closed = true;
-          unsubscribe();
-          writeSseEvent(res, { type: "response.completed", response: incompleteResponse });
-          writeDone(res);
-          res.end();
-          return;
-        }
 
         const content =
           Array.isArray(payloads) && payloads.length > 0
@@ -861,14 +1288,19 @@ export async function handleOpenResponsesHttpRequest(
         accumulatedText = content;
         sawAssistantDelta = true;
 
-        writeSseEvent(res, {
-          type: "response.output_text.delta",
-          item_id: outputItemId,
-          output_index: 0,
-          content_index: 0,
-          delta: content,
-        });
+        if (!shouldBufferAssistantText) {
+          emittedAssistantDelta = true;
+          writeSseEvent(res, {
+            type: "response.output_text.delta",
+            item_id: outputItemId,
+            output_index: 0,
+            content_index: 0,
+            delta: content,
+          });
+        }
       }
+
+      maybeFinalize();
     } catch (err) {
       logWarn(`openresponses: streaming response failed: ${String(err)}`);
       if (closed) {
@@ -876,6 +1308,7 @@ export async function handleOpenResponsesHttpRequest(
       }
 
       finalUsage = finalUsage ?? createEmptyUsage();
+      runFinished = true;
       const errorResponse = createResponseResource({
         id: responseId,
         model,

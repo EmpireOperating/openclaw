@@ -182,6 +182,12 @@ export type GatewayHttpResponsesConfig = {
    */
   enabled?: boolean;
   /**
+   * If true, tool-bearing direct-action prompts without explicit `tool_choice`
+   * implicitly require a tool call before assistant text.
+   * Default: false.
+   */
+  implicitToolChoiceRequiredForDirectAction?: boolean;
+  /**
    * Max request body size in bytes for `/v1/responses`.
    * Default: 20MB.
    */

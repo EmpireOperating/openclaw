@@ -38,6 +38,8 @@ export const FIELD_HELP: Record<string, string> = {
     "DANGEROUS. Disable Control UI device identity checks (token/password only).",
   "gateway.http.endpoints.chatCompletions.enabled":
     "Enable the OpenAI-compatible `POST /v1/chat/completions` endpoint (default: false).",
+  "gateway.http.endpoints.responses.implicitToolChoiceRequiredForDirectAction":
+    "Require a tool call for direct-action prompts without explicit tool_choice when tools are present (default: false).",
   "gateway.reload.mode": 'Hot reload strategy for config changes ("hybrid" recommended).',
   "gateway.reload.debounceMs": "Debounce window (ms) before applying config changes.",
   "gateway.nodes.browser.mode":

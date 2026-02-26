@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { HISTORY_CONTEXT_MARKER } from "../auto-reply/reply/history.js";
 import { CURRENT_MESSAGE_MARKER } from "../auto-reply/reply/mentions.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
@@ -20,6 +20,20 @@ beforeAll(async () => {
 afterAll(async () => {
   await enabledServer.close({ reason: "openresponses enabled suite done" });
 });
+
+beforeEach(() => {
+  return resetReliabilityMetrics();
+});
+
+async function resetReliabilityMetrics() {
+  const mod = await import("./openresponses-http.js");
+  mod.resetOpenResponsesToolCallReliabilityMetrics();
+}
+
+async function readReliabilityMetrics() {
+  const mod = await import("./openresponses-http.js");
+  return mod.getOpenResponsesToolCallReliabilityMetrics();
+}
 
 async function startServer(port: number, opts?: { openResponsesEnabled?: boolean }) {
   const { startGatewayServer } = await import("./server.js");
@@ -43,6 +57,29 @@ async function writeGatewayConfig(config: Record<string, unknown>) {
   }
   await fs.mkdir(path.dirname(configPath), { recursive: true });
   await fs.writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
+}
+
+async function startResponsesServerWithConfig(
+  responsesConfig: Record<string, unknown>,
+): Promise<{ port: number; close: (params: { reason: string }) => Promise<void> }> {
+  await writeGatewayConfig({
+    gateway: {
+      http: {
+        endpoints: {
+          responses: {
+            enabled: true,
+            ...responsesConfig,
+          },
+        },
+      },
+    },
+  });
+  const port = await getFreePort();
+  const server = await startServer(port, { openResponsesEnabled: true });
+  return {
+    port,
+    close: (params) => server.close(params),
+  };
 }
 
 async function postResponses(port: number, body: unknown, headers?: Record<string, string>) {
@@ -323,7 +360,10 @@ describe("OpenResponses HTTP API (e2e)", () => {
       ).toBeUndefined();
       await ensureResponseConsumed(resToolNone);
 
-      mockAgentOnce([{ text: "ok" }]);
+      mockAgentOnce([{ text: "ok" }], {
+        stopReason: "tool_calls",
+        pendingToolCalls: [{ id: "call_get_time", name: "get_time", arguments: "{}" }],
+      });
       const resToolChoice = await postResponses(port, {
         model: "openclaw",
         input: "hi",
@@ -346,6 +386,16 @@ describe("OpenResponses HTTP API (e2e)", () => {
           ?.clientTools ?? [];
       expect(clientTools).toHaveLength(1);
       expect(clientTools[0]?.function?.name).toBe("get_time");
+      const toolChoiceJson = (await resToolChoice.json()) as {
+        status?: string;
+        output?: Array<{ type?: string; name?: string }>;
+      };
+      expect(toolChoiceJson.status).toBe("incomplete");
+      expect(
+        (toolChoiceJson.output ?? []).some(
+          (item) => item.type === "function_call" && item.name === "get_time",
+        ),
+      ).toBe(true);
       await ensureResponseConsumed(resToolChoice);
 
       const resUnknownTool = await postResponses(port, {
@@ -361,6 +411,61 @@ describe("OpenResponses HTTP API (e2e)", () => {
       });
       expect(resUnknownTool.status).toBe(400);
       await ensureResponseConsumed(resUnknownTool);
+
+      mockAgentOnce([{ text: "I will do it now." }], {
+        stopReason: "stop",
+      });
+      const resRequiredNoToolCall = await postResponses(port, {
+        model: "openclaw",
+        input: "run this",
+        tools: [
+          {
+            type: "function",
+            function: { name: "exec", description: "run command" },
+          },
+        ],
+        tool_choice: "required",
+      });
+      expect(resRequiredNoToolCall.status).toBe(422);
+      const requiredNoToolCallJson = (await resRequiredNoToolCall.json()) as {
+        status?: string;
+        error?: { code?: string; message?: string };
+      };
+      expect(requiredNoToolCallJson.status).toBe("failed");
+      expect(requiredNoToolCallJson.error?.code).toBe("tool_choice_not_satisfied");
+      expect(requiredNoToolCallJson.error?.message ?? "").toMatch(/tool_choice=required/i);
+      await ensureResponseConsumed(resRequiredNoToolCall);
+
+      mockAgentOnce([{ text: "wrong tool" }], {
+        stopReason: "tool_calls",
+        pendingToolCalls: [{ id: "call_1", name: "get_weather", arguments: "{}" }],
+      });
+      const resSpecificToolMismatch = await postResponses(port, {
+        model: "openclaw",
+        input: "check now",
+        tools: [
+          {
+            type: "function",
+            function: { name: "get_weather", description: "Get weather" },
+          },
+          {
+            type: "function",
+            function: { name: "exec", description: "Run command" },
+          },
+        ],
+        tool_choice: { type: "function", function: { name: "exec" } },
+      });
+      expect(resSpecificToolMismatch.status).toBe(422);
+      const specificToolMismatchJson = (await resSpecificToolMismatch.json()) as {
+        status?: string;
+        error?: { code?: string; message?: string };
+      };
+      expect(specificToolMismatchJson.status).toBe("failed");
+      expect(specificToolMismatchJson.error?.code).toBe("tool_choice_not_satisfied");
+      expect(specificToolMismatchJson.error?.message ?? "").toMatch(
+        /tool_choice\.function\.name="exec"/i,
+      );
+      await ensureResponseConsumed(resSpecificToolMismatch);
 
       mockAgentOnce([{ text: "ok" }]);
       const resMaxTokens = await postResponses(port, {
@@ -509,6 +614,124 @@ describe("OpenResponses HTTP API (e2e)", () => {
         const parsed = JSON.parse(event.data) as { type?: string };
         expect(event.event).toBe(parsed.type);
       }
+
+      agentCommand.mockReset();
+      agentCommand.mockImplementationOnce((async (opts: unknown) => {
+        const runId = (opts as { runId?: string } | undefined)?.runId ?? "";
+        emitAgentEvent({
+          runId,
+          stream: "assistant",
+          data: { delta: "I'll do it now." },
+        });
+        return {
+          payloads: [{ text: "I'll do it now." }],
+          meta: {
+            stopReason: "tool_calls",
+            pendingToolCalls: [
+              {
+                id: "call_direct_action",
+                name: "exec",
+                arguments: '{"command":"echo ready"}',
+              },
+            ],
+          },
+        };
+      }) as never);
+
+      const resToolCallAfterDelta = await postResponses(port, {
+        stream: true,
+        model: "openclaw",
+        input: "run this",
+        tools: [
+          {
+            type: "function",
+            function: { name: "exec", description: "run command" },
+          },
+        ],
+      });
+      expect(resToolCallAfterDelta.status).toBe(200);
+
+      const toolCallAfterDeltaText = await resToolCallAfterDelta.text();
+      const toolCallAfterDeltaEvents = parseSseEvents(toolCallAfterDeltaText);
+      const toolCallAfterDeltaTextDeltas = toolCallAfterDeltaEvents
+        .filter((event) => event.event === "response.output_text.delta")
+        .map((event) => {
+          const parsed = JSON.parse(event.data) as { delta?: string };
+          return parsed.delta ?? "";
+        })
+        .join("");
+      expect(toolCallAfterDeltaTextDeltas).toBe("");
+      const addedOutputItems = toolCallAfterDeltaEvents.filter(
+        (event) => event.event === "response.output_item.added",
+      );
+      expect(
+        addedOutputItems.some((event) => {
+          const parsed = JSON.parse(event.data) as { item?: { type?: string; name?: string } };
+          return parsed.item?.type === "function_call" && parsed.item?.name === "exec";
+        }),
+      ).toBe(true);
+
+      const completedEvents = toolCallAfterDeltaEvents.filter(
+        (event) => event.event === "response.completed",
+      );
+      expect(completedEvents).toHaveLength(1);
+      const completedPayload = JSON.parse(completedEvents[0]?.data ?? "{}") as {
+        response?: { status?: string; output?: Array<{ type?: string }> };
+      };
+      expect(completedPayload.response?.status).toBe("incomplete");
+      expect(
+        (completedPayload.response?.output ?? []).some((item) => item.type === "function_call"),
+      ).toBe(true);
+      expect((await readReliabilityMetrics()).toolCallAfterTextDelta).toBe(1);
+
+      agentCommand.mockReset();
+      agentCommand.mockImplementationOnce((async (opts: unknown) => {
+        const runId = (opts as { runId?: string } | undefined)?.runId ?? "";
+        emitAgentEvent({
+          runId,
+          stream: "assistant",
+          data: { delta: "I'll do it now." },
+        });
+        return {
+          payloads: [{ text: "I'll do it now." }],
+          meta: {
+            stopReason: "stop",
+          },
+        };
+      }) as never);
+
+      const resRequiredStreamNoToolCall = await postResponses(port, {
+        stream: true,
+        model: "openclaw",
+        input: "run this",
+        tools: [
+          {
+            type: "function",
+            function: { name: "exec", description: "run command" },
+          },
+        ],
+        tool_choice: "required",
+      });
+      expect(resRequiredStreamNoToolCall.status).toBe(200);
+      const requiredStreamNoToolCallText = await resRequiredStreamNoToolCall.text();
+      const requiredStreamNoToolCallEvents = parseSseEvents(requiredStreamNoToolCallText);
+      const failedEvents = requiredStreamNoToolCallEvents.filter(
+        (event) => event.event === "response.failed",
+      );
+      expect(failedEvents).toHaveLength(1);
+      const failedPayload = JSON.parse(failedEvents[0]?.data ?? "{}") as {
+        response?: { error?: { code?: string; message?: string } };
+      };
+      expect(failedPayload.response?.error?.code).toBe("tool_choice_not_satisfied");
+      expect(failedPayload.response?.error?.message ?? "").toMatch(/tool_choice=required/i);
+      const failedDeltas = requiredStreamNoToolCallEvents
+        .filter((event) => event.event === "response.output_text.delta")
+        .map((event) => {
+          const parsed = JSON.parse(event.data) as { delta?: string };
+          return parsed.delta ?? "";
+        })
+        .join("");
+      expect(failedDeltas).toBe("");
     } finally {
       // shared server
     }
@@ -703,5 +926,406 @@ describe("OpenResponses HTTP API (e2e)", () => {
     } finally {
       await capServer.close({ reason: "responses url cap hardening test done" });
     }
+  });
+
+  it("retries unmet tool_choice once and records retry success metrics", async () => {
+    const port = enabledPort;
+    agentCommand.mockReset();
+    agentCommand
+      .mockResolvedValueOnce({
+        payloads: [{ text: "I can do that." }],
+        meta: { stopReason: "stop" },
+      } as never)
+      .mockResolvedValueOnce({
+        payloads: [{ text: "Calling tool." }],
+        meta: {
+          stopReason: "tool_calls",
+          pendingToolCalls: [{ id: "call_retry_ok", name: "exec", arguments: '{"command":"pwd"}' }],
+        },
+      } as never);
+
+    const res = await postResponses(port, {
+      model: "openclaw",
+      input: "run this",
+      tools: [
+        {
+          type: "function",
+          function: { name: "exec", description: "run command" },
+        },
+      ],
+      tool_choice: "required",
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      status?: string;
+      output?: Array<{ type?: string; name?: string }>;
+    };
+    expect(json.status).toBe("incomplete");
+    expect((json.output ?? []).some((item) => item.type === "function_call")).toBe(true);
+    expect((json.output ?? []).some((item) => item.name === "exec")).toBe(true);
+
+    const metrics = await readReliabilityMetrics();
+    expect(metrics.toolChoiceNotSatisfied).toBe(1);
+    expect(metrics.toolChoiceRetryAttempted).toBe(1);
+    expect(metrics.toolChoiceRetrySucceeded).toBe(1);
+    expect(metrics.toolChoiceRetryFailed).toBe(0);
+  });
+
+  it("records retry failure metrics when tool_choice remains unmet", async () => {
+    const port = enabledPort;
+    agentCommand.mockReset();
+    agentCommand
+      .mockResolvedValueOnce({
+        payloads: [{ text: "I'll do it." }],
+        meta: { stopReason: "stop" },
+      } as never)
+      .mockResolvedValueOnce({
+        payloads: [{ text: "Still no tool." }],
+        meta: { stopReason: "stop" },
+      } as never);
+
+    const res = await postResponses(port, {
+      model: "openclaw",
+      input: "do it",
+      tools: [
+        {
+          type: "function",
+          function: { name: "exec", description: "run command" },
+        },
+      ],
+      tool_choice: "required",
+    });
+    expect(res.status).toBe(422);
+    const json = (await res.json()) as {
+      status?: string;
+      error?: { code?: string };
+    };
+    expect(json.status).toBe("failed");
+    expect(json.error?.code).toBe("tool_choice_not_satisfied");
+
+    const metrics = await readReliabilityMetrics();
+    expect(metrics.toolChoiceNotSatisfied).toBe(2);
+    expect(metrics.toolChoiceRetryAttempted).toBe(1);
+    expect(metrics.toolChoiceRetrySucceeded).toBe(0);
+    expect(metrics.toolChoiceRetryFailed).toBe(1);
+  });
+
+  it("does not auto-require tool calls for direct-action prompts when flag is disabled", async () => {
+    const port = enabledPort;
+    agentCommand.mockReset();
+    agentCommand.mockResolvedValueOnce({
+      payloads: [{ text: "I'll do it." }],
+      meta: { stopReason: "stop" },
+    } as never);
+
+    const res = await postResponses(port, {
+      model: "openclaw",
+      input: "do it",
+      tools: [
+        {
+          type: "function",
+          function: { name: "exec", description: "run command" },
+        },
+      ],
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      status?: string;
+      output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
+    };
+    expect(json.status).toBe("completed");
+    const text = json.output?.[0]?.content?.[0]?.text ?? "";
+    expect(text).toContain("I'll do it.");
+    expect(agentCommand).toHaveBeenCalledTimes(1);
+    const metrics = await readReliabilityMetrics();
+    expect(metrics.toolChoiceRetryAttempted).toBe(0);
+  });
+
+  it("auto-requires tool calls for direct-action prompts in non-stream mode when enabled", async () => {
+    const scopedServer = await startResponsesServerWithConfig({
+      implicitToolChoiceRequiredForDirectAction: true,
+    });
+    try {
+      agentCommand.mockReset();
+      agentCommand
+        .mockResolvedValueOnce({
+          payloads: [{ text: "I'll do it." }],
+          meta: { stopReason: "stop" },
+        } as never)
+        .mockResolvedValueOnce({
+          payloads: [{ text: "Still no tool." }],
+          meta: { stopReason: "stop" },
+        } as never);
+
+      const failed = await postResponses(scopedServer.port, {
+        model: "openclaw",
+        input: "do it",
+        tools: [
+          {
+            type: "function",
+            function: { name: "exec", description: "run command" },
+          },
+        ],
+      });
+      expect(failed.status).toBe(422);
+      const failedJson = (await failed.json()) as {
+        status?: string;
+        error?: { code?: string; message?: string };
+      };
+      expect(failedJson.status).toBe("failed");
+      expect(failedJson.error?.code).toBe("tool_choice_not_satisfied");
+      expect(failedJson.error?.message ?? "").toMatch(/tool_choice=required/i);
+      expect(agentCommand).toHaveBeenCalledTimes(2);
+
+      agentCommand.mockReset();
+      agentCommand.mockResolvedValueOnce({
+        payloads: [{ text: "calling exec" }],
+        meta: {
+          stopReason: "tool_calls",
+          pendingToolCalls: [{ id: "call_direct_nonstream", name: "exec", arguments: "{}" }],
+        },
+      } as never);
+
+      const succeeded = await postResponses(scopedServer.port, {
+        model: "openclaw",
+        input: "run this",
+        tools: [
+          {
+            type: "function",
+            function: { name: "exec", description: "run command" },
+          },
+        ],
+      });
+      expect(succeeded.status).toBe(200);
+      const succeededJson = (await succeeded.json()) as {
+        status?: string;
+        output?: Array<{ type?: string; name?: string }>;
+      };
+      expect(succeededJson.status).toBe("incomplete");
+      expect(
+        (succeededJson.output ?? []).some(
+          (item) => item.type === "function_call" && item.name === "exec",
+        ),
+      ).toBe(true);
+    } finally {
+      await scopedServer.close({
+        reason: "direct-action non-stream implicit tool_choice test done",
+      });
+    }
+  });
+
+  it("auto-requires tool calls for direct-action prompts in stream mode when enabled", async () => {
+    const scopedServer = await startResponsesServerWithConfig({
+      implicitToolChoiceRequiredForDirectAction: true,
+    });
+    try {
+      agentCommand.mockReset();
+      agentCommand.mockImplementationOnce((async (opts: unknown) => {
+        const runId = (opts as { runId?: string } | undefined)?.runId ?? "";
+        emitAgentEvent({
+          runId,
+          stream: "assistant",
+          data: { delta: "I'll do it now." },
+        });
+        return {
+          payloads: [{ text: "I'll do it now." }],
+          meta: { stopReason: "stop" },
+        };
+      }) as never);
+
+      const res = await postResponses(scopedServer.port, {
+        stream: true,
+        model: "openclaw",
+        input: "check now",
+        tools: [
+          {
+            type: "function",
+            function: { name: "exec", description: "run command" },
+          },
+        ],
+      });
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      const events = parseSseEvents(text);
+      const failedEvents = events.filter((event) => event.event === "response.failed");
+      expect(failedEvents).toHaveLength(1);
+      const failedPayload = JSON.parse(failedEvents[0]?.data ?? "{}") as {
+        response?: { error?: { code?: string; message?: string } };
+      };
+      expect(failedPayload.response?.error?.code).toBe("tool_choice_not_satisfied");
+      expect(failedPayload.response?.error?.message ?? "").toMatch(/tool_choice=required/i);
+      const deltas = events
+        .filter((event) => event.event === "response.output_text.delta")
+        .map((event) => {
+          const parsed = JSON.parse(event.data) as { delta?: string };
+          return parsed.delta ?? "";
+        })
+        .join("");
+      expect(deltas).toBe("");
+    } finally {
+      await scopedServer.close({
+        reason: "direct-action stream implicit tool_choice test done",
+      });
+    }
+  });
+
+  it("keeps Q&A prompts text-first with tools when direct-action auto-require is enabled", async () => {
+    const scopedServer = await startResponsesServerWithConfig({
+      implicitToolChoiceRequiredForDirectAction: true,
+    });
+    try {
+      agentCommand.mockReset();
+      agentCommand.mockResolvedValueOnce({
+        payloads: [{ text: "It's currently 3 PM." }],
+        meta: { stopReason: "stop" },
+      } as never);
+
+      const res = await postResponses(scopedServer.port, {
+        model: "openclaw",
+        input: "What time is it right now?",
+        tools: [
+          {
+            type: "function",
+            function: { name: "get_time", description: "Get current time" },
+          },
+        ],
+      });
+      expect(res.status).toBe(200);
+      const json = (await res.json()) as {
+        status?: string;
+        output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
+      };
+      expect(json.status).toBe("completed");
+      const text = json.output?.[0]?.content?.[0]?.text ?? "";
+      expect(text).toContain("3 PM");
+      expect(agentCommand).toHaveBeenCalledTimes(1);
+    } finally {
+      await scopedServer.close({
+        reason: "q-and-a direct-action heuristic false-positive test done",
+      });
+    }
+  });
+
+  it("streams tool_choice function mismatch as response.failed", async () => {
+    const port = enabledPort;
+    agentCommand.mockReset();
+    agentCommand.mockImplementationOnce((async (opts: unknown) => {
+      const runId = (opts as { runId?: string } | undefined)?.runId ?? "";
+      emitAgentEvent({
+        runId,
+        stream: "assistant",
+        data: { delta: "Using weather tool." },
+      });
+      return {
+        payloads: [{ text: "Using weather tool." }],
+        meta: {
+          stopReason: "tool_calls",
+          pendingToolCalls: [{ id: "call_weather", name: "get_weather", arguments: "{}" }],
+        },
+      };
+    }) as never);
+
+    const res = await postResponses(port, {
+      stream: true,
+      model: "openclaw",
+      input: "check now",
+      tools: [
+        {
+          type: "function",
+          function: { name: "get_weather", description: "Get weather" },
+        },
+        {
+          type: "function",
+          function: { name: "exec", description: "Run command" },
+        },
+      ],
+      tool_choice: { type: "function", function: { name: "exec" } },
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    const events = parseSseEvents(text);
+    const failedEvents = events.filter((event) => event.event === "response.failed");
+    expect(failedEvents).toHaveLength(1);
+    const failedPayload = JSON.parse(failedEvents[0]?.data ?? "{}") as {
+      response?: { error?: { code?: string; message?: string } };
+    };
+    expect(failedPayload.response?.error?.code).toBe("tool_choice_not_satisfied");
+    expect(failedPayload.response?.error?.message ?? "").toMatch(
+      /tool_choice\.function\.name="exec"/i,
+    );
+    const deltas = events
+      .filter((event) => event.event === "response.output_text.delta")
+      .map((event) => {
+        const parsed = JSON.parse(event.data) as { delta?: string };
+        return parsed.delta ?? "";
+      })
+      .join("");
+    expect(deltas).toBe("");
+  });
+
+  it("exposes tool-call reliability diagnostics over authenticated HTTP", async () => {
+    const port = enabledPort;
+    const diagnosticsUrl = `http://127.0.0.1:${port}/v1/responses/diagnostics/tool-call-reliability`;
+
+    const unauthenticated = await fetch(diagnosticsUrl);
+    expect(unauthenticated.status).toBe(401);
+    await ensureResponseConsumed(unauthenticated);
+
+    const wrongMethod = await fetch(diagnosticsUrl, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer secret",
+        "content-type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(wrongMethod.status).toBe(405);
+    await ensureResponseConsumed(wrongMethod);
+
+    agentCommand.mockReset();
+    agentCommand
+      .mockResolvedValueOnce({
+        payloads: [{ text: "I'll do it." }],
+        meta: { stopReason: "stop" },
+      } as never)
+      .mockResolvedValueOnce({
+        payloads: [{ text: "Still no tool." }],
+        meta: { stopReason: "stop" },
+      } as never);
+
+    const failed = await postResponses(port, {
+      model: "openclaw",
+      input: "do it",
+      tools: [
+        {
+          type: "function",
+          function: { name: "exec", description: "run command" },
+        },
+      ],
+      tool_choice: "required",
+    });
+    expect(failed.status).toBe(422);
+    await ensureResponseConsumed(failed);
+
+    const diagnostics = await fetch(diagnosticsUrl, {
+      headers: {
+        authorization: "Bearer secret",
+      },
+    });
+    expect(diagnostics.status).toBe(200);
+    const diagnosticsJson = (await diagnostics.json()) as {
+      object?: string;
+      metrics?: {
+        toolChoiceNotSatisfied?: number;
+        toolChoiceRetryAttempted?: number;
+        toolChoiceRetrySucceeded?: number;
+        toolChoiceRetryFailed?: number;
+      };
+    };
+    expect(diagnosticsJson.object).toBe("openresponses.tool_call_reliability");
+    expect(diagnosticsJson.metrics?.toolChoiceNotSatisfied).toBe(2);
+    expect(diagnosticsJson.metrics?.toolChoiceRetryAttempted).toBe(1);
+    expect(diagnosticsJson.metrics?.toolChoiceRetrySucceeded).toBe(0);
+    expect(diagnosticsJson.metrics?.toolChoiceRetryFailed).toBe(1);
   });
 });
