@@ -103,12 +103,6 @@ export function hasWsSession(sessionId: string): boolean {
 
 type AnyMessage = Message & { role: string; content: unknown };
 
-type ToolResultMessage = Message & {
-  role: "toolResult";
-  toolCallId?: string;
-  toolUseId?: string;
-};
-
 function toNonEmptyString(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;
@@ -117,8 +111,20 @@ function toNonEmptyString(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function isToolResultMessage(message: Message): message is ToolResultMessage {
-  return (message as AnyMessage).role === "toolResult";
+function normalizeOpenAiResponsesCallId(value: unknown): string | null {
+  const callId = toNonEmptyString(value);
+  if (!callId) {
+    return null;
+  }
+  if (!callId.startsWith("call_")) {
+    return callId;
+  }
+  const separatorIndex = callId.indexOf("|");
+  return separatorIndex === -1 ? callId : callId.slice(0, separatorIndex);
+}
+
+function isMissingToolCallOutputErrorMessage(message: string): boolean {
+  return message.includes("No tool call found for function call output with call_id");
 }
 
 function collectAssistantToolCallIds(messages: Message[]): Set<string> {
@@ -133,7 +139,7 @@ function collectAssistantToolCallIds(messages: Message[]): Set<string> {
       if (block.type !== "toolCall") {
         continue;
       }
-      const callId = toNonEmptyString(block.id);
+      const callId = normalizeOpenAiResponsesCallId(block.id);
       if (callId) {
         callIds.add(callId);
       }
@@ -141,6 +147,37 @@ function collectAssistantToolCallIds(messages: Message[]): Set<string> {
   }
 
   return callIds;
+}
+
+function collectDeclaredFunctionCallIds(input: InputItem[]): Set<string> {
+  const declaredCallIds = new Set<string>();
+  for (const item of input) {
+    if (item.type === "function_call" && item.call_id) {
+      declaredCallIds.add(item.call_id);
+    }
+  }
+  return declaredCallIds;
+}
+
+function dropOrphanFunctionCallOutputs(input: InputItem[]): {
+  sanitized: InputItem[];
+  droppedCallIds: string[];
+} {
+  const declaredCallIds = collectDeclaredFunctionCallIds(input);
+
+  const dropped = new Set<string>();
+  const sanitized = input.filter((item) => {
+    if (item.type !== "function_call_output") {
+      return true;
+    }
+    if (declaredCallIds.has(item.call_id)) {
+      return true;
+    }
+    dropped.add(item.call_id);
+    return false;
+  });
+
+  return { sanitized, droppedCallIds: Array.from(dropped) };
 }
 
 /** Convert pi-ai content (string | ContentPart[]) to plain text. */
@@ -253,7 +290,7 @@ export function convertMessagesToInputItems(messages: Message[]): InputItem[] {
               });
               textParts.length = 0;
             }
-            const callId = toNonEmptyString(block.id);
+            const callId = normalizeOpenAiResponsesCallId(block.id);
             const toolName = toNonEmptyString(block.name);
             if (!callId || !toolName) {
               continue;
@@ -297,7 +334,9 @@ export function convertMessagesToInputItems(messages: Message[]): InputItem[] {
         content: unknown;
         isError: boolean;
       };
-      const callId = toNonEmptyString(tr.toolCallId) ?? toNonEmptyString(tr.toolUseId);
+      const callId =
+        normalizeOpenAiResponsesCallId(tr.toolCallId) ??
+        normalizeOpenAiResponsesCallId(tr.toolUseId);
       if (!callId) {
         continue;
       }
@@ -547,6 +586,8 @@ export function createOpenAIWebSocketStreamFn(
             instructions: context.systemPrompt ?? undefined,
             signal,
           });
+          // Warm-up responses are synthetic probes and must never seed replay state.
+          session.manager.clearPreviousResponseId();
           log.debug(`[ws-stream] warm-up completed for session=${sessionId}`);
         } catch (warmErr) {
           if (signal?.aborted) {
@@ -561,6 +602,18 @@ export function createOpenAIWebSocketStreamFn(
       // ── 3. Compute incremental vs full input ─────────────────────────────
       let prevResponseId = session.manager.previousResponseId;
       let inputItems: InputItem[];
+      let usePreviousResponseId = false;
+
+      const buildSanitizedFullInput = (): InputItem[] => {
+        const fullInput = buildFullInput(context);
+        const { sanitized, droppedCallIds } = dropOrphanFunctionCallOutputs(fullInput);
+        if (droppedCallIds.length > 0) {
+          log.warn(
+            `[ws-stream] session=${sessionId}: dropped orphan function_call_output item(s) without matching function_call in full input; dropped_call_ids=${droppedCallIds.join(",")}`,
+          );
+        }
+        return sanitized;
+      };
 
       const resetReplayState = (reason: string) => {
         log.warn(`[ws-stream] session=${sessionId}: ${reason}`);
@@ -587,21 +640,22 @@ export function createOpenAIWebSocketStreamFn(
 
       if (prevResponseId && session.lastContextLength > 0) {
         const replayWindow = context.messages.slice(session.lastContextLength);
-        const incrementalToolResults = replayWindow.filter(isToolResultMessage);
 
-        if (incrementalToolResults.length === 0) {
+        if (replayWindow.length === 0) {
           resetReplayState(
-            "no incremental tool results available for replay; resetting to full-context send",
+            "no incremental messages available for replay; resetting to full-context send",
           );
-          inputItems = buildFullInput(context);
+          inputItems = buildSanitizedFullInput();
           log.debug(
             `[ws-stream] session=${sessionId}: full context send (${inputItems.length} items) after replay reset`,
           );
         } else {
-          inputItems = convertMessagesToInputItems(incrementalToolResults);
+          inputItems = convertMessagesToInputItems(replayWindow);
 
-          // Validate that every tool-result call_id maps to an assistant toolCall in context.
+          // Validate that every tool-result call_id maps to an assistant toolCall in context,
+          // and that the incremental replay window is self-contained when it includes outputs.
           const knownCallIds = collectAssistantToolCallIds(context.messages);
+          const declaredReplayCallIds = collectDeclaredFunctionCallIds(inputItems);
           const outputIds = Array.from(
             new Set(
               inputItems
@@ -613,24 +667,34 @@ export function createOpenAIWebSocketStreamFn(
             ),
           );
           const unknownOutputs = outputIds.filter((id) => !knownCallIds.has(id));
+          const replayOrphanOutputs = outputIds.filter((id) => !declaredReplayCallIds.has(id));
 
           if (unknownOutputs.length > 0) {
             resetReplayState(
-              `tool-result replay has unknown call_id(s) without matching assistant toolCall in context; unknown=${unknownOutputs.join(",")}`,
+              `replay has unknown call_id(s) without matching assistant toolCall in context; unknown=${unknownOutputs.join(",")}`,
             );
-            inputItems = buildFullInput(context);
+            inputItems = buildSanitizedFullInput();
             log.debug(
               `[ws-stream] session=${sessionId}: full context send (${inputItems.length} items) after replay call_id mismatch`,
             );
-          } else {
+          } else if (replayOrphanOutputs.length > 0) {
+            resetReplayState(
+              `incremental replay has function_call_output item(s) without same-window function_call; orphan=${replayOrphanOutputs.join(",")}`,
+            );
+            inputItems = buildSanitizedFullInput();
             log.debug(
-              `[ws-stream] session=${sessionId}: incremental tool-result send (${inputItems.length} items) previous_response_id=${prevResponseId}`,
+              `[ws-stream] session=${sessionId}: full context send (${inputItems.length} items) after replay self-consistency fallback`,
+            );
+          } else {
+            usePreviousResponseId = true;
+            log.debug(
+              `[ws-stream] session=${sessionId}: incremental replay send (${inputItems.length} items) previous_response_id=${prevResponseId}`,
             );
           }
         }
       } else {
         // First turn or replay-state reset: send full context
-        inputItems = buildFullInput(context);
+        inputItems = buildSanitizedFullInput();
         log.debug(
           `[ws-stream] session=${sessionId}: full context send (${inputItems.length} items)`,
         );
@@ -685,7 +749,9 @@ export function createOpenAIWebSocketStreamFn(
         input: inputItems,
         instructions: context.systemPrompt ?? undefined,
         tools: tools.length > 0 ? tools : undefined,
-        ...(prevResponseId ? { previous_response_id: prevResponseId } : {}),
+        ...(usePreviousResponseId && prevResponseId
+          ? { previous_response_id: prevResponseId }
+          : {}),
         ...extraParams,
       };
       options?.onPayload?.(payload);
@@ -797,6 +863,17 @@ export function createOpenAIWebSocketStreamFn(
     queueMicrotask(() =>
       run().catch((err) => {
         const errorMessage = err instanceof Error ? err.message : String(err);
+        if (isMissingToolCallOutputErrorMessage(errorMessage)) {
+          const session = wsRegistry.get(sessionId);
+          if (session) {
+            session.manager.clearPreviousResponseId();
+            session.lastContextLength = 0;
+            session.lastContextBoundaryKey = null;
+            log.warn(
+              `[ws-stream] session=${sessionId}: cleared replay state after missing-tool-call-output error`,
+            );
+          }
+        }
         log.warn(`[ws-stream] session=${sessionId} run error: ${errorMessage}`);
         eventStream.push({
           type: "error",

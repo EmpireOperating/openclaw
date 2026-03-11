@@ -46,6 +46,8 @@ export const ACPX_BACKEND_ID = "acpx";
 
 const ACPX_RUNTIME_HANDLE_PREFIX = "acpx:v1:";
 const DEFAULT_AGENT_FALLBACK = "codex";
+const OPENAI_API_KEY_ENV = "OPENAI_API_KEY";
+const CODEX_API_KEY_ENV = "CODEX_API_KEY";
 const ACPX_EXIT_CODE_PERMISSION_DENIED = 5;
 const ACPX_CAPABILITIES: AcpRuntimeCapabilities = {
   controls: ["session/set_mode", "session/set_config_option", "session/status"],
@@ -210,6 +212,7 @@ export class AcpxRuntime implements AcpRuntime {
     });
 
     let events = await this.runControlCommand({
+      agent,
       args: ensureCommand,
       cwd,
       fallbackCode: "ACP_SESSION_INIT_FAILED",
@@ -228,6 +231,7 @@ export class AcpxRuntime implements AcpRuntime {
         command: ["sessions", "new", "--name", sessionName],
       });
       events = await this.runControlCommand({
+        agent,
         args: newCommand,
         cwd,
         fallbackCode: "ACP_SESSION_INIT_FAILED",
@@ -303,6 +307,7 @@ export class AcpxRuntime implements AcpRuntime {
         command: this.config.command,
         args,
         cwd: state.cwd,
+        env: this.resolveCommandEnv(state.agent, "ACP_TURN_FAILED"),
       },
       this.spawnCommandOptions,
     );
@@ -396,6 +401,7 @@ export class AcpxRuntime implements AcpRuntime {
       command: ["status", "--session", state.name],
     });
     const events = await this.runControlCommand({
+      agent: state.agent,
       args,
       cwd: state.cwd,
       fallbackCode: "ACP_TURN_FAILED",
@@ -442,6 +448,7 @@ export class AcpxRuntime implements AcpRuntime {
       command: ["set-mode", mode, "--session", state.name],
     });
     await this.runControlCommand({
+      agent: state.agent,
       args,
       cwd: state.cwd,
       fallbackCode: "ACP_TURN_FAILED",
@@ -465,6 +472,7 @@ export class AcpxRuntime implements AcpRuntime {
       command: ["set", key, value, "--session", state.name],
     });
     await this.runControlCommand({
+      agent: state.agent,
       args,
       cwd: state.cwd,
       fallbackCode: "ACP_TURN_FAILED",
@@ -560,6 +568,7 @@ export class AcpxRuntime implements AcpRuntime {
       command: ["cancel", "--session", state.name],
     });
     await this.runControlCommand({
+      agent: state.agent,
       args,
       cwd: state.cwd,
       fallbackCode: "ACP_TURN_FAILED",
@@ -575,6 +584,7 @@ export class AcpxRuntime implements AcpRuntime {
       command: ["sessions", "close", state.name],
     });
     await this.runControlCommand({
+      agent: state.agent,
       args,
       cwd: state.cwd,
       fallbackCode: "ACP_TURN_FAILED",
@@ -674,7 +684,37 @@ export class AcpxRuntime implements AcpRuntime {
     return resolved;
   }
 
+  private resolveCommandEnv(agent: string, fallbackCode: AcpRuntimeErrorCode): NodeJS.ProcessEnv {
+    const authMode = this.config.authMode;
+    if (authMode === "inherit") {
+      return process.env;
+    }
+
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    const isCodexAgent = agent.trim().toLowerCase() === "codex";
+
+    if (authMode === "oauth") {
+      delete env[OPENAI_API_KEY_ENV];
+      delete env[CODEX_API_KEY_ENV];
+      return env;
+    }
+
+    if (
+      isCodexAgent &&
+      !asTrimmedString(process.env[CODEX_API_KEY_ENV]) &&
+      !asTrimmedString(process.env[OPENAI_API_KEY_ENV])
+    ) {
+      throw new AcpRuntimeError(
+        fallbackCode,
+        "acpx auth mode 'api-key' requires CODEX_API_KEY or OPENAI_API_KEY for codex agent.",
+      );
+    }
+
+    return env;
+  }
+
   private async runControlCommand(params: {
+    agent: string;
     args: string[];
     cwd: string;
     fallbackCode: AcpRuntimeErrorCode;
@@ -686,6 +726,7 @@ export class AcpxRuntime implements AcpRuntime {
         command: this.config.command,
         args: params.args,
         cwd: params.cwd,
+        env: this.resolveCommandEnv(params.agent, params.fallbackCode),
       },
       this.spawnCommandOptions,
       {

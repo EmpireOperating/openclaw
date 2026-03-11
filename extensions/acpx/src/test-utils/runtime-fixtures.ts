@@ -23,6 +23,8 @@ const fs = require("node:fs");
 const args = process.argv.slice(2);
 const logPath = process.env.MOCK_ACPX_LOG;
 const openclawShell = process.env.OPENCLAW_SHELL || "";
+const openaiApiKey = process.env.OPENAI_API_KEY || "";
+const codexApiKey = process.env.CODEX_API_KEY || "";
 const writeLog = (entry) => {
   if (!logPath) return;
   fs.appendFileSync(logPath, JSON.stringify(entry) + "\n");
@@ -75,7 +77,7 @@ const setKey = command === "set" ? String(args[commandIndex + 1] || "") : "";
 const setValue = command === "set" ? String(args[commandIndex + 2] || "") : "";
 
 if (command === "sessions" && args[commandIndex + 1] === "ensure") {
-  writeLog({ kind: "ensure", agent, args, sessionName: ensureName });
+  writeLog({ kind: "ensure", agent, args, sessionName: ensureName, openaiApiKey, codexApiKey });
   if (process.env.MOCK_ACPX_ENSURE_EMPTY === "1") {
     emitJson({ action: "session_ensured", name: ensureName });
   } else {
@@ -92,7 +94,7 @@ if (command === "sessions" && args[commandIndex + 1] === "ensure") {
 }
 
 if (command === "sessions" && args[commandIndex + 1] === "new") {
-  writeLog({ kind: "new", agent, args, sessionName: ensureName });
+  writeLog({ kind: "new", agent, args, sessionName: ensureName, openaiApiKey, codexApiKey });
   if (process.env.MOCK_ACPX_NEW_EMPTY === "1") {
     emitJson({ action: "session_created", name: ensureName });
   } else {
@@ -204,6 +206,8 @@ if (command === "prompt") {
     sessionName: sessionFromOption,
     stdinText,
     openclawShell,
+    openaiApiKey,
+    codexApiKey,
   });
   const requestId = "req-1";
 
@@ -311,6 +315,7 @@ process.exit(2);
 
 export async function createMockRuntimeFixture(params?: {
   permissionMode?: ResolvedAcpxPluginConfig["permissionMode"];
+  authMode?: ResolvedAcpxPluginConfig["authMode"];
   queueOwnerTtlSeconds?: number;
   mcpServers?: ResolvedAcpxPluginConfig["mcpServers"];
 }): Promise<{
@@ -330,6 +335,7 @@ export async function createMockRuntimeFixture(params?: {
     cwd: dir,
     permissionMode: params?.permissionMode ?? "approve-all",
     nonInteractivePermissions: "fail",
+    authMode: params?.authMode ?? "inherit",
     strictWindowsCmdWrapper: true,
     queueOwnerTtlSeconds: params?.queueOwnerTtlSeconds ?? 0.1,
     mcpServers: params?.mcpServers ?? {},

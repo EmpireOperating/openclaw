@@ -8,6 +8,9 @@ export type AcpxPermissionMode = (typeof ACPX_PERMISSION_MODES)[number];
 export const ACPX_NON_INTERACTIVE_POLICIES = ["deny", "fail"] as const;
 export type AcpxNonInteractivePermissionPolicy = (typeof ACPX_NON_INTERACTIVE_POLICIES)[number];
 
+export const ACPX_AUTH_MODES = ["inherit", "oauth", "api-key"] as const;
+export type AcpxAuthMode = (typeof ACPX_AUTH_MODES)[number];
+
 export const ACPX_PINNED_VERSION = "0.1.15";
 export const ACPX_VERSION_ANY = "any";
 const ACPX_BIN_NAME = process.platform === "win32" ? "acpx.cmd" : "acpx";
@@ -37,6 +40,7 @@ export type AcpxPluginConfig = {
   cwd?: string;
   permissionMode?: AcpxPermissionMode;
   nonInteractivePermissions?: AcpxNonInteractivePermissionPolicy;
+  authMode?: AcpxAuthMode;
   strictWindowsCmdWrapper?: boolean;
   timeoutSeconds?: number;
   queueOwnerTtlSeconds?: number;
@@ -51,6 +55,7 @@ export type ResolvedAcpxPluginConfig = {
   cwd: string;
   permissionMode: AcpxPermissionMode;
   nonInteractivePermissions: AcpxNonInteractivePermissionPolicy;
+  authMode: AcpxAuthMode;
   strictWindowsCmdWrapper: boolean;
   timeoutSeconds?: number;
   queueOwnerTtlSeconds: number;
@@ -59,6 +64,7 @@ export type ResolvedAcpxPluginConfig = {
 
 const DEFAULT_PERMISSION_MODE: AcpxPermissionMode = "approve-reads";
 const DEFAULT_NON_INTERACTIVE_POLICY: AcpxNonInteractivePermissionPolicy = "fail";
+const DEFAULT_AUTH_MODE: AcpxAuthMode = "inherit";
 const DEFAULT_QUEUE_OWNER_TTL_SECONDS = 0.1;
 const DEFAULT_STRICT_WINDOWS_CMD_WRAPPER = true;
 
@@ -78,6 +84,10 @@ function isNonInteractivePermissionPolicy(
   value: string,
 ): value is AcpxNonInteractivePermissionPolicy {
   return ACPX_NON_INTERACTIVE_POLICIES.includes(value as AcpxNonInteractivePermissionPolicy);
+}
+
+function isAuthMode(value: string): value is AcpxAuthMode {
+  return ACPX_AUTH_MODES.includes(value as AcpxAuthMode);
 }
 
 function isMcpServerConfig(value: unknown): value is McpServerConfig {
@@ -123,6 +133,7 @@ function parseAcpxPluginConfig(value: unknown): ParseResult {
     "cwd",
     "permissionMode",
     "nonInteractivePermissions",
+    "authMode",
     "strictWindowsCmdWrapper",
     "timeoutSeconds",
     "queueOwnerTtlSeconds",
@@ -175,6 +186,14 @@ function parseAcpxPluginConfig(value: unknown): ParseResult {
     };
   }
 
+  const authMode = value.authMode;
+  if (authMode !== undefined && (typeof authMode !== "string" || !isAuthMode(authMode))) {
+    return {
+      ok: false,
+      message: `authMode must be one of: ${ACPX_AUTH_MODES.join(", ")}`,
+    };
+  }
+
   const timeoutSeconds = value.timeoutSeconds;
   if (
     timeoutSeconds !== undefined &&
@@ -222,6 +241,7 @@ function parseAcpxPluginConfig(value: unknown): ParseResult {
       permissionMode: typeof permissionMode === "string" ? permissionMode : undefined,
       nonInteractivePermissions:
         typeof nonInteractivePermissions === "string" ? nonInteractivePermissions : undefined,
+      authMode: typeof authMode === "string" ? authMode : undefined,
       strictWindowsCmdWrapper:
         typeof strictWindowsCmdWrapper === "boolean" ? strictWindowsCmdWrapper : undefined,
       timeoutSeconds: typeof timeoutSeconds === "number" ? timeoutSeconds : undefined,
@@ -277,6 +297,10 @@ export function createAcpxPluginConfigSchema(): OpenClawPluginConfigSchema {
         nonInteractivePermissions: {
           type: "string",
           enum: [...ACPX_NON_INTERACTIVE_POLICIES],
+        },
+        authMode: {
+          type: "string",
+          enum: [...ACPX_AUTH_MODES],
         },
         strictWindowsCmdWrapper: { type: "boolean" },
         timeoutSeconds: { type: "number", minimum: 0.001 },
@@ -348,6 +372,7 @@ export function resolveAcpxPluginConfig(params: {
     permissionMode: normalized.permissionMode ?? DEFAULT_PERMISSION_MODE,
     nonInteractivePermissions:
       normalized.nonInteractivePermissions ?? DEFAULT_NON_INTERACTIVE_POLICY,
+    authMode: normalized.authMode ?? DEFAULT_AUTH_MODE,
     strictWindowsCmdWrapper:
       normalized.strictWindowsCmdWrapper ?? DEFAULT_STRICT_WINDOWS_CMD_WRAPPER,
     timeoutSeconds: normalized.timeoutSeconds,

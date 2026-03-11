@@ -289,4 +289,19 @@ describe("spawnAndCollect", () => {
     const result = await resultPromise;
     expect(result.error?.name).toBe("AbortError");
   });
+
+  it("uses explicit env overrides when provided", async () => {
+    const result = await spawnAndCollect({
+      command: process.execPath,
+      args: ["-e", "process.stdout.write(process.env.OPENAI_API_KEY ? 'set' : 'unset')"],
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        OPENAI_API_KEY: "",
+      },
+    });
+
+    expect(result.error).toBeNull();
+    expect(result.stdout.trim()).toBe("unset");
+  });
 });

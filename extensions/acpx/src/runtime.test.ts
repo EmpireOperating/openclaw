@@ -24,6 +24,7 @@ beforeAll(async () => {
       mcpServers: {},
       permissionMode: "approve-reads",
       nonInteractivePermissions: "fail",
+      authMode: "inherit",
       strictWindowsCmdWrapper: true,
       queueOwnerTtlSeconds: 0.1,
     },
@@ -511,6 +512,81 @@ describe("AcpxRuntime", () => {
     } finally {
       delete process.env.MOCK_ACPX_ENSURE_EMPTY;
       delete process.env.MOCK_ACPX_NEW_EMPTY;
+    }
+  });
+
+  it("scrubs OpenAI/Codex API keys in oauth authMode", async () => {
+    const prevOpenai = process.env.OPENAI_API_KEY;
+    const prevCodex = process.env.CODEX_API_KEY;
+    process.env.OPENAI_API_KEY = "openai-test-key";
+    process.env.CODEX_API_KEY = "codex-test-key";
+    try {
+      const { runtime, logPath } = await createMockRuntimeFixture({ authMode: "oauth" });
+      const handle = await runtime.ensureSession({
+        sessionKey: "agent:codex:acp:oauth-auth-mode",
+        agent: "codex",
+        mode: "persistent",
+      });
+      for await (const _event of runtime.runTurn({
+        handle,
+        text: "hello",
+        mode: "prompt",
+        requestId: "req-auth-oauth",
+      })) {
+        // consume stream
+      }
+
+      const logs = await readMockRuntimeLogEntries(logPath);
+      const ensure = logs.find((entry) => entry.kind === "ensure");
+      const prompt = logs.find((entry) => entry.kind === "prompt");
+      expect(ensure?.openaiApiKey).toBe("");
+      expect(ensure?.codexApiKey).toBe("");
+      expect(prompt?.openaiApiKey).toBe("");
+      expect(prompt?.codexApiKey).toBe("");
+    } finally {
+      if (prevOpenai === undefined) {
+        delete process.env.OPENAI_API_KEY;
+      } else {
+        process.env.OPENAI_API_KEY = prevOpenai;
+      }
+      if (prevCodex === undefined) {
+        delete process.env.CODEX_API_KEY;
+      } else {
+        process.env.CODEX_API_KEY = prevCodex;
+      }
+    }
+  });
+
+  it("requires API key for codex when authMode is api-key", async () => {
+    const prevOpenai = process.env.OPENAI_API_KEY;
+    const prevCodex = process.env.CODEX_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.CODEX_API_KEY;
+    try {
+      const { runtime } = await createMockRuntimeFixture({ authMode: "api-key" });
+      await expect(
+        runtime.ensureSession({
+          sessionKey: "agent:codex:acp:api-key-auth-mode",
+          agent: "codex",
+          mode: "persistent",
+        }),
+      ).rejects.toMatchObject({
+        code: "ACP_SESSION_INIT_FAILED",
+        message: expect.stringContaining(
+          "auth mode 'api-key' requires CODEX_API_KEY or OPENAI_API_KEY",
+        ),
+      });
+    } finally {
+      if (prevOpenai === undefined) {
+        delete process.env.OPENAI_API_KEY;
+      } else {
+        process.env.OPENAI_API_KEY = prevOpenai;
+      }
+      if (prevCodex === undefined) {
+        delete process.env.CODEX_API_KEY;
+      } else {
+        process.env.CODEX_API_KEY = prevCodex;
+      }
     }
   });
 });

@@ -22,6 +22,7 @@ describe("acpx plugin config parsing", () => {
     expect(resolved.allowPluginLocalInstall).toBe(true);
     expect(resolved.cwd).toBe(path.resolve("/tmp/workspace"));
     expect(resolved.strictWindowsCmdWrapper).toBe(true);
+    expect(resolved.authMode).toBe("inherit");
     expect(resolved.mcpServers).toEqual({});
   });
 
@@ -133,6 +134,28 @@ describe("acpx plugin config parsing", () => {
         workspaceDir: "/tmp/workspace",
       }),
     ).toThrow("strictWindowsCmdWrapper must be a boolean");
+  });
+
+  it("accepts authMode override", () => {
+    const resolved = resolveAcpxPluginConfig({
+      rawConfig: {
+        authMode: "oauth",
+      },
+      workspaceDir: "/tmp/workspace",
+    });
+
+    expect(resolved.authMode).toBe("oauth");
+  });
+
+  it("rejects invalid authMode", () => {
+    expect(() =>
+      resolveAcpxPluginConfig({
+        rawConfig: {
+          authMode: "token",
+        },
+        workspaceDir: "/tmp/workspace",
+      }),
+    ).toThrow("authMode must be one of: inherit, oauth, api-key");
   });
 
   it("accepts mcp server maps", () => {
