@@ -180,6 +180,157 @@ function dropOrphanFunctionCallOutputs(input: InputItem[]): {
   return { sanitized, droppedCallIds: Array.from(dropped) };
 }
 
+const TRACE_TEXT_PREVIEW_LIMIT = 120;
+const TRACE_ARRAY_PREVIEW_LIMIT = 10;
+
+function previewText(value: string, limit = TRACE_TEXT_PREVIEW_LIMIT): string {
+  if (value.length <= limit) {
+    return value;
+  }
+  return `${value.slice(0, Math.max(0, limit - 1))}…`;
+}
+
+function serializeTrace(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function summarizeMessageForTrace(message: Message, index: number): Record<string, unknown> {
+  const m = message as AnyMessage;
+  if (m.role === "user") {
+    const text = contentToText(m.content);
+    return {
+      index,
+      role: "user",
+      textLength: text.length,
+      textPreview: previewText(text),
+    };
+  }
+
+  if (m.role === "toolResult") {
+    const tr = m as unknown as {
+      toolCallId?: string;
+      toolUseId?: string;
+      toolName?: string;
+      content: unknown;
+      isError?: boolean;
+    };
+    const callId =
+      normalizeOpenAiResponsesCallId(tr.toolCallId) ??
+      normalizeOpenAiResponsesCallId(tr.toolUseId);
+    const text = contentToText(tr.content);
+    return {
+      index,
+      role: "toolResult",
+      toolName: tr.toolName ?? null,
+      callId,
+      isError: tr.isError ?? false,
+      outputLength: text.length,
+      outputPreview: previewText(text),
+    };
+  }
+
+  if (m.role === "assistant") {
+    const content = Array.isArray(m.content) ? m.content : [];
+    const objectBlocks = (content as unknown[]).filter(
+      (block): block is Record<string, unknown> => typeof block === "object" && block !== null,
+    );
+    const toolCalls = objectBlocks
+      .filter((block) => block.type === "toolCall")
+      .map((block) => ({
+        name: typeof block.name === "string" ? block.name : null,
+        callId: normalizeOpenAiResponsesCallId(block.id),
+      }));
+    const text = contentToText(content);
+    return {
+      index,
+      role: "assistant",
+      blockTypes: content
+        .map((block) => (typeof block === "object" && block && "type" in block ? block.type : typeof block))
+        .slice(0, TRACE_ARRAY_PREVIEW_LIMIT),
+      toolCalls: toolCalls.slice(0, TRACE_ARRAY_PREVIEW_LIMIT),
+      textLength: text.length,
+      textPreview: previewText(text),
+    };
+  }
+
+  return { index, role: (message as AnyMessage).role };
+}
+
+function summarizeMessagesForTrace(messages: Message[], startIndex = 0): Array<Record<string, unknown>> {
+  return messages
+    .slice(startIndex)
+    .map((message, offset) => summarizeMessageForTrace(message, startIndex + offset));
+}
+
+function summarizeInputItemsForTrace(inputItems: InputItem[]): Array<Record<string, unknown>> {
+  return inputItems.slice(0, TRACE_ARRAY_PREVIEW_LIMIT).map((item, index) => {
+    if (item.type === "message") {
+      const text = typeof item.content === "string" ? item.content : serializeTrace(item.content);
+      return {
+        index,
+        type: item.type,
+        role: item.role,
+        textLength: text.length,
+        textPreview: previewText(text),
+      };
+    }
+
+    if (item.type === "function_call") {
+      return {
+        index,
+        type: item.type,
+        callId: item.call_id,
+        name: item.name,
+        argumentsLength: item.arguments.length,
+        argumentsPreview: previewText(item.arguments),
+      };
+    }
+
+    if (item.type === "function_call_output") {
+      return {
+        index,
+        type: item.type,
+        callId: item.call_id,
+        outputLength: item.output.length,
+        outputPreview: previewText(item.output),
+      };
+    }
+
+    return { index, type: item.type };
+  });
+}
+
+function summarizeResponseOutputForTrace(response: ResponseObject): Array<Record<string, unknown>> {
+  return (response.output ?? []).slice(0, TRACE_ARRAY_PREVIEW_LIMIT).map((item, index) => {
+    if (item.type === "function_call") {
+      return {
+        index,
+        type: item.type,
+        callId: item.call_id ?? null,
+        name: item.name ?? null,
+      };
+    }
+    if (item.type === "message") {
+      const text = (item.content ?? [])
+        .filter((part) => part.type === "output_text")
+        .map((part) => part.text ?? "")
+        .join("");
+      return {
+        index,
+        type: item.type,
+        role: item.role ?? null,
+        textLength: text.length,
+        textPreview: previewText(text),
+      };
+    }
+    return { index, type: item.type };
+  });
+}
+
 /** Convert pi-ai content (string | ContentPart[]) to plain text. */
 function contentToText(content: unknown): string {
   if (typeof content === "string") {
@@ -509,6 +660,7 @@ export function createOpenAIWebSocketStreamFn(
 ): StreamFn {
   return (model, context, options) => {
     const eventStream = createAssistantMessageEventStream();
+    let traceSnapshot = serializeTrace({ phase: "init", sessionId });
 
     const run = async () => {
       const transport = resolveWsTransport(options);
@@ -603,20 +755,30 @@ export function createOpenAIWebSocketStreamFn(
       let prevResponseId = session.manager.previousResponseId;
       let inputItems: InputItem[];
       let usePreviousResponseId = false;
+      let replayWindow: Message[] = [];
+      let knownCallIds: string[] = [];
+      let declaredReplayCallIds: string[] = [];
+      let outputIds: string[] = [];
+      let unknownOutputs: string[] = [];
+      let replayOrphanOutputs: string[] = [];
+      let lastFullInputDroppedCallIds: string[] = [];
 
       const buildSanitizedFullInput = (): InputItem[] => {
         const fullInput = buildFullInput(context);
         const { sanitized, droppedCallIds } = dropOrphanFunctionCallOutputs(fullInput);
+        lastFullInputDroppedCallIds = droppedCallIds;
         if (droppedCallIds.length > 0) {
           log.warn(
-            `[ws-stream] session=${sessionId}: dropped orphan function_call_output item(s) without matching function_call in full input; dropped_call_ids=${droppedCallIds.join(",")}`,
+            `[ws-stream] session=${sessionId}: dropped orphan function_call_output item(s) without matching function_call in full input; dropped_call_ids=${droppedCallIds.join(",")} full_input=${serializeTrace(summarizeInputItemsForTrace(fullInput))}`,
           );
         }
         return sanitized;
       };
 
       const resetReplayState = (reason: string) => {
-        log.warn(`[ws-stream] session=${sessionId}: ${reason}`);
+        log.warn(
+          `[ws-stream] session=${sessionId}: ${reason} replay_window=${serializeTrace(summarizeMessagesForTrace(replayWindow, Math.max(0, context.messages.length - replayWindow.length)))} recent_context=${serializeTrace(summarizeMessagesForTrace(context.messages, Math.max(0, context.messages.length - 6)))}`,
+        );
         session.manager.clearPreviousResponseId();
         prevResponseId = null;
         session.lastContextLength = 0;
@@ -639,7 +801,7 @@ export function createOpenAIWebSocketStreamFn(
       }
 
       if (prevResponseId && session.lastContextLength > 0) {
-        const replayWindow = context.messages.slice(session.lastContextLength);
+        replayWindow = context.messages.slice(session.lastContextLength);
 
         if (replayWindow.length === 0) {
           resetReplayState(
@@ -654,9 +816,9 @@ export function createOpenAIWebSocketStreamFn(
 
           // Validate that every tool-result call_id maps to an assistant toolCall in context,
           // and that the incremental replay window is self-contained when it includes outputs.
-          const knownCallIds = collectAssistantToolCallIds(context.messages);
-          const declaredReplayCallIds = collectDeclaredFunctionCallIds(inputItems);
-          const outputIds = Array.from(
+          knownCallIds = Array.from(collectAssistantToolCallIds(context.messages));
+          declaredReplayCallIds = Array.from(collectDeclaredFunctionCallIds(inputItems));
+          outputIds = Array.from(
             new Set(
               inputItems
                 .filter(
@@ -666,8 +828,8 @@ export function createOpenAIWebSocketStreamFn(
                 .map((i) => i.call_id),
             ),
           );
-          const unknownOutputs = outputIds.filter((id) => !knownCallIds.has(id));
-          const replayOrphanOutputs = outputIds.filter((id) => !declaredReplayCallIds.has(id));
+          unknownOutputs = outputIds.filter((id) => !knownCallIds.includes(id));
+          replayOrphanOutputs = outputIds.filter((id) => !declaredReplayCallIds.includes(id));
 
           if (unknownOutputs.length > 0) {
             resetReplayState(
@@ -754,6 +916,32 @@ export function createOpenAIWebSocketStreamFn(
           : {}),
         ...extraParams,
       };
+      traceSnapshot = serializeTrace({
+        phase: "pre-send",
+        sessionId,
+        transport,
+        modelId: model.id,
+        contextLength: context.messages.length,
+        lastContextLength: session.lastContextLength,
+        previousResponseId: prevResponseId,
+        usePreviousResponseId,
+        warmUpAttempted: session.warmUpAttempted,
+        lastContextBoundaryKey: session.lastContextBoundaryKey,
+        replayWindowLength: replayWindow.length,
+        replayWindow: summarizeMessagesForTrace(
+          replayWindow,
+          Math.max(0, context.messages.length - replayWindow.length),
+        ),
+        recentContext: summarizeMessagesForTrace(context.messages, Math.max(0, context.messages.length - 8)),
+        inputItems: summarizeInputItemsForTrace(inputItems),
+        knownCallIds,
+        declaredReplayCallIds,
+        outputIds,
+        unknownOutputs,
+        replayOrphanOutputs,
+        droppedFullInputCallIds: lastFullInputDroppedCallIds,
+      });
+      log.info(`[ws-stream][trace] ${traceSnapshot}`);
       options?.onPayload?.(payload);
 
       try {
@@ -825,6 +1013,9 @@ export function createOpenAIWebSocketStreamFn(
             session.lastContextBoundaryKey = boundaryMessage
               ? JSON.stringify(boundaryMessage)
               : null;
+            log.info(
+              `[ws-stream][trace][completed] session=${sessionId} response_id=${event.response.id ?? "unknown"} previous_response_id=${session.manager.previousResponseId ?? ""} output=${serializeTrace(summarizeResponseOutputForTrace(event.response))} pre_send=${traceSnapshot}`,
+            );
             // Build and emit the assistant message
             const assistantMsg = buildAssistantMessageFromResponse(event.response, {
               api: model.api,
@@ -838,9 +1029,15 @@ export function createOpenAIWebSocketStreamFn(
           } else if (event.type === "response.failed") {
             cleanup();
             const errMsg = event.response?.error?.message ?? "Response failed";
+            log.warn(
+              `[ws-stream][trace][response.failed] session=${sessionId} response_id=${event.response?.id ?? "unknown"} error=${errMsg} response_output=${serializeTrace(summarizeResponseOutputForTrace(event.response))} pre_send=${traceSnapshot}`,
+            );
             reject(new Error(`OpenAI WebSocket response failed: ${errMsg}`));
           } else if (event.type === "error") {
             cleanup();
+            log.warn(
+              `[ws-stream][trace][socket-error] session=${sessionId} message=${event.message} code=${event.code} pre_send=${traceSnapshot}`,
+            );
             reject(new Error(`OpenAI WebSocket error: ${event.message} (code=${event.code})`));
           } else if (event.type === "response.output_text.delta") {
             // Stream partial text updates for responsive UI
@@ -870,11 +1067,13 @@ export function createOpenAIWebSocketStreamFn(
             session.lastContextLength = 0;
             session.lastContextBoundaryKey = null;
             log.warn(
-              `[ws-stream] session=${sessionId}: cleared replay state after missing-tool-call-output error`,
+              `[ws-stream] session=${sessionId}: cleared replay state after missing-tool-call-output error trace=${traceSnapshot}`,
             );
           }
         }
-        log.warn(`[ws-stream] session=${sessionId} run error: ${errorMessage}`);
+        log.warn(
+          `[ws-stream] session=${sessionId} run error: ${errorMessage} trace=${traceSnapshot} context_tail=${serializeTrace(summarizeMessagesForTrace(context.messages, Math.max(0, context.messages.length - 8)))}`,
+        );
         eventStream.push({
           type: "error",
           reason: "error",

@@ -1,3 +1,4 @@
+import type { SubagentEndResult } from "../context-engine/types.js";
 import type { DeliveryContext } from "../utils/delivery-context.js";
 import type { SubagentRunOutcome } from "./subagent-announce.js";
 import type { SubagentLifecycleEndedReason } from "./subagent-lifecycle-events.js";
@@ -51,6 +52,8 @@ export type SubagentRunRecord = {
   fallbackFrozenResultCapturedAt?: number;
   /** Set after the subagent_ended hook has been emitted successfully once. */
   endedHookEmittedAt?: number;
+  /** Optional context-engine intent captured at subagent end. */
+  contextEngineEndResult?: SubagentEndResult;
   attachmentsDir?: string;
   attachmentsRootDir?: string;
   retainAttachmentsOnKeep?: boolean;

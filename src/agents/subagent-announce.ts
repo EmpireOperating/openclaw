@@ -8,6 +8,7 @@ import {
   resolveMainSessionKey,
   resolveStorePath,
 } from "../config/sessions.js";
+import type { SubagentEndResult } from "../context-engine/types.js";
 import { callGateway } from "../gateway/call.js";
 import { createBoundDeliveryRouter } from "../infra/outbound/bound-delivery-router.js";
 import type { ConversationRef } from "../infra/outbound/session-binding-service.js";
@@ -355,6 +356,38 @@ function formatUntrustedChildResult(resultText?: string | null): string {
     resultText?.trim() || "(no output)",
     "<<<END_UNTRUSTED_CHILD_RESULT>>>",
   ].join("\n");
+}
+
+function formatContextEngineEndResult(result?: SubagentEndResult): string | undefined {
+  if (!result || typeof result !== "object") {
+    return undefined;
+  }
+  const lines: string[] = [];
+  const reason = typeof result.reason === "string" ? result.reason.trim() : "";
+  if (reason) {
+    lines.push(`reason: ${reason}`);
+  }
+  const followUpPrompt =
+    typeof result.followUpPrompt === "string" ? result.followUpPrompt.trim() : "";
+  if (followUpPrompt) {
+    lines.push(`followUpPrompt: ${followUpPrompt}`);
+  }
+  const decisions = Array.isArray(result.merge?.decisions)
+    ? result.merge?.decisions.map((value) => String(value).trim()).filter(Boolean)
+    : [];
+  const openActions = Array.isArray(result.merge?.openActions)
+    ? result.merge?.openActions.map((value) => String(value).trim()).filter(Boolean)
+    : [];
+  if (decisions.length > 0) {
+    lines.push(`merge.decisions: ${decisions.join(" | ")}`);
+  }
+  if (openActions.length > 0) {
+    lines.push(`merge.openActions: ${openActions.join(" | ")}`);
+  }
+  if (lines.length === 0) {
+    return undefined;
+  }
+  return ["Context engine end intents:", ...lines].join("\n");
 }
 
 function buildChildCompletionFindings(
@@ -1157,6 +1190,7 @@ export async function runSubagentAnnounceFlow(params: {
   expectsCompletionMessage?: boolean;
   spawnMode?: SpawnSubagentMode;
   wakeOnDescendantSettle?: boolean;
+  contextEngineEndResult?: SubagentEndResult;
   signal?: AbortSignal;
   bestEffortDeliver?: boolean;
 }): Promise<boolean> {
@@ -1343,7 +1377,11 @@ export async function runSubagentAnnounceFlow(params: {
 
     const taskLabel = params.label || params.task || "task";
     const announceSessionId = childSessionId || "unknown";
-    const findings = childCompletionFindings || reply || "(no output)";
+    const baseFindings = childCompletionFindings || reply || "(no output)";
+    const contextEngineFindings = formatContextEngineEndResult(params.contextEngineEndResult);
+    const findings = contextEngineFindings
+      ? [baseFindings, contextEngineFindings].filter(Boolean).join("\n\n")
+      : baseFindings;
 
     let requesterIsSubagent = requesterIsInternalSession();
     if (requesterIsSubagent) {

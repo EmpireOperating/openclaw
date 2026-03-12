@@ -59,6 +59,23 @@ export type SubagentSpawnPreparation = {
 export type SubagentEndReason = "deleted" | "completed" | "swept" | "released";
 export type ContextEngineRuntimeContext = Record<string, unknown>;
 
+export type SubagentEndOutcome =
+  | { status: "ok" | "timeout" | "unknown" }
+  | { status: "error"; error?: string };
+
+export type SubagentEndMergeIntent = {
+  decisions?: string[];
+  openActions?: string[];
+};
+
+export type SubagentEndResult = {
+  ok?: boolean;
+  reason?: string;
+  followUpPrompt?: string | null;
+  merge?: SubagentEndMergeIntent;
+  [key: string]: unknown;
+};
+
 /**
  * ContextEngine defines the pluggable contract for context management.
  *
@@ -159,7 +176,16 @@ export interface ContextEngine {
   /**
    * Notify the context engine that a subagent lifecycle ended.
    */
-  onSubagentEnded?(params: { childSessionKey: string; reason: SubagentEndReason }): Promise<void>;
+  onSubagentEnded?(params: {
+    childSessionKey: string;
+    reason: SubagentEndReason;
+    runId?: string;
+    task?: string;
+    label?: string;
+    completionText?: string | null;
+    outcome?: SubagentEndOutcome;
+    workspaceDir?: string;
+  }): Promise<SubagentEndResult | void>;
 
   /**
    * Dispose of any resources held by the engine.

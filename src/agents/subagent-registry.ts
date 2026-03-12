@@ -10,7 +10,7 @@ import {
 } from "../config/sessions.js";
 import { ensureContextEnginesInitialized } from "../context-engine/init.js";
 import { resolveContextEngine } from "../context-engine/registry.js";
-import type { SubagentEndReason } from "../context-engine/types.js";
+import type { SubagentEndReason, SubagentEndResult } from "../context-engine/types.js";
 import { callGateway } from "../gateway/call.js";
 import { onAgentEvent } from "../infra/agent-events.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
@@ -314,8 +314,13 @@ function schedulePendingLifecycleError(params: { runId: string; endedAt: number;
 async function notifyContextEngineSubagentEnded(params: {
   childSessionKey: string;
   reason: SubagentEndReason;
+  runId?: string;
+  task?: string;
+  label?: string;
+  completionText?: string | null;
+  outcome?: SubagentRunOutcome;
   workspaceDir?: string;
-}) {
+}): Promise<SubagentEndResult | undefined> {
   try {
     const cfg = loadConfig();
     ensureRuntimePluginsLoaded({
@@ -325,11 +330,13 @@ async function notifyContextEngineSubagentEnded(params: {
     ensureContextEnginesInitialized();
     const engine = await resolveContextEngine(cfg);
     if (!engine.onSubagentEnded) {
-      return;
+      return undefined;
     }
-    await engine.onSubagentEnded(params);
+    const result = await engine.onSubagentEnded(params);
+    return result ?? undefined;
   } catch (err) {
     log.warn("context-engine onSubagentEnded failed (best-effort)", { err });
+    return undefined;
   }
 }
 
@@ -552,6 +559,7 @@ function startSubagentAnnounceCleanupFlow(runId: string, entry: SubagentRunRecor
     spawnMode: entry.spawnMode,
     expectsCompletionMessage: entry.expectsCompletionMessage,
     wakeOnDescendantSettle: entry.wakeOnDescendantSettle === true,
+    contextEngineEndResult: entry.contextEngineEndResult,
   })
     .then((didAnnounce) => {
       void finalizeSubagentCleanup(runId, entry.cleanup, didAnnounce);
@@ -868,7 +876,7 @@ async function finalizeSubagentCleanup(
       entry.frozenResultText = undefined;
       entry.frozenResultCapturedAt = undefined;
     }
-    completeCleanupBookkeeping({
+    await completeCleanupBookkeeping({
       runId,
       entry,
       cleanup,
@@ -918,7 +926,7 @@ async function finalizeSubagentCleanup(
     const completionReason = resolveCleanupCompletionReason(entry);
     await emitCompletionEndedHookIfNeeded(entry, completionReason);
     logAnnounceGiveUp(entry, deferredDecision.reason);
-    completeCleanupBookkeeping({
+    await completeCleanupBookkeeping({
       runId,
       entry,
       cleanup: "keep",
@@ -960,7 +968,7 @@ async function emitCompletionEndedHookIfNeeded(
   }
 }
 
-function completeCleanupBookkeeping(params: {
+async function completeCleanupBookkeeping(params: {
   runId: string;
   entry: SubagentRunRecord;
   cleanup: "delete" | "keep";
@@ -968,9 +976,14 @@ function completeCleanupBookkeeping(params: {
 }) {
   if (params.cleanup === "delete") {
     clearPendingLifecycleError(params.runId);
-    void notifyContextEngineSubagentEnded({
+    await notifyContextEngineSubagentEnded({
       childSessionKey: params.entry.childSessionKey,
       reason: "deleted",
+      runId: params.entry.runId,
+      task: params.entry.task,
+      label: params.entry.label,
+      completionText: params.entry.frozenResultText ?? null,
+      outcome: params.entry.outcome,
       workspaceDir: params.entry.workspaceDir,
     });
     subagentRuns.delete(params.runId);
@@ -978,11 +991,19 @@ function completeCleanupBookkeeping(params: {
     retryDeferredCompletedAnnounces(params.runId);
     return;
   }
-  void notifyContextEngineSubagentEnded({
+  const endResult = await notifyContextEngineSubagentEnded({
     childSessionKey: params.entry.childSessionKey,
     reason: "completed",
+    runId: params.entry.runId,
+    task: params.entry.task,
+    label: params.entry.label,
+    completionText: params.entry.frozenResultText ?? null,
+    outcome: params.entry.outcome,
     workspaceDir: params.entry.workspaceDir,
   });
+  if (endResult) {
+    params.entry.contextEngineEndResult = endResult;
+  }
   params.entry.cleanupCompletedAt = params.completedAt;
   persistSubagentRuns();
   retryDeferredCompletedAnnounces(params.runId);
